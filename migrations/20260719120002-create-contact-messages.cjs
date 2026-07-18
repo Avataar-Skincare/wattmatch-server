@@ -2,7 +2,7 @@
 
 module.exports = {
   async up(queryInterface, Sequelize) {
-    await queryInterface.createTable('contact_messages', {
+    await queryInterface.createTable('wattmatch_contact_messages', {
       id: {
         type: Sequelize.INTEGER.UNSIGNED,
         autoIncrement: true,
@@ -15,6 +15,6 @@ module.exports = {
   },
 
   async down(queryInterface) {
-    await queryInterface.dropTable('contact_messages');
+    await queryInterface.dropTable('wattmatch_contact_messages');
   },
 };

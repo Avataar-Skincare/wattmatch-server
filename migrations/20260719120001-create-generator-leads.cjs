@@ -2,7 +2,7 @@
 
 module.exports = {
   async up(queryInterface, Sequelize) {
-    await queryInterface.createTable('generator_leads', {
+    await queryInterface.createTable('wattmatch_generator_leads', {
       id: {
         type: Sequelize.INTEGER.UNSIGNED,
         autoIncrement: true,
@@ -18,10 +18,10 @@ module.exports = {
       created_at: { type: Sequelize.DATE, allowNull: false },
       updated_at: { type: Sequelize.DATE, allowNull: false },
     });
-    await queryInterface.addIndex('generator_leads', ['email']);
+    await queryInterface.addIndex('wattmatch_generator_leads', ['email']);
   },
 
   async down(queryInterface) {
-    await queryInterface.dropTable('generator_leads');
+    await queryInterface.dropTable('wattmatch_generator_leads');
   },
 };
