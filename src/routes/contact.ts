@@ -11,7 +11,8 @@ router.post('/', async (req, res) => {
     }
     const entry = await ContactMessage.create({ email });
     res.status(201).json({ id: entry.id });
-  } catch {
+  } catch (err) {
+    console.error('Failed to save contact message:', err);
     res.status(500).json({ error: 'Failed to save message' });
   }
 });
