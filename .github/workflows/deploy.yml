@@ -1,0 +1,66 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        type: choice
+        options:
+          - test
+          - prod
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Resolve target host
+        id: vars
+        run: |
+          if [ "${{ inputs.environment }}" = "prod" ]; then
+            echo "host=${{ secrets.EC2_PROD_HOST }}" >> $GITHUB_OUTPUT
+          else
+            echo "host=${{ secrets.EC2_TEST_HOST }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download artifact from S3
+        run: aws s3 cp s3://${{ secrets.S3_BUILD_BUCKET }}/${{ github.repository }}/${{ github.ref_name }}.zip ./artifact.zip
+
+      - name: Copy artifact to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ steps.vars.outputs.host }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: './artifact.zip'
+          target: '~/deploys/wattmatch-server'
+
+      - name: Unpack, migrate, restart via PM2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ steps.vars.outputs.host }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            cd ~/deploys/wattmatch-server
+            rm -rf release && mkdir release
+            unzip -o artifact.zip -d release
+            cd release
+            # .env is NOT shipped in the artifact — it must already exist on this host
+            # (DB_HOST/DB_USER/DB_PASSWORD/DB_NAME + CORS_ORIGIN scoped to this environment's frontend URL)
+            cp ../.env .env
+            npm install --production
+            npm run migrate
+            if pm2 pid wattmatch-server > /dev/null 2>&1; then
+              pm2 restart wattmatch-server --update-env
+            else
+              pm2 start npm --name wattmatch-server -- run start
+            fi
