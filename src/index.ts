@@ -4,6 +4,7 @@ import cors from 'cors';
 import { sequelize } from './db/sequelize.js';
 import leadsRouter from './routes/leads.js';
 import contactRouter from './routes/contact.js';
+import adminRouter from './routes/admin.js';
 
 const app = express();
 const port = process.env.PORT ?? 4000;
@@ -22,6 +23,7 @@ app.use((req, res, next) => {
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/leads', leadsRouter);
 app.use('/api/contact', contactRouter);
+app.use('/api/admin', adminRouter);
 
 app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error(`[${new Date().toISOString()}] Unhandled error on ${req.method} ${req.originalUrl}:`, err);
