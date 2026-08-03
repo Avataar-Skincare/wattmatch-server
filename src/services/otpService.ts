@@ -1,6 +1,12 @@
 import { redis } from '../lib/redis.js';
-import { sendOtpSms } from './fast2sms.js';
 import { sendOtpEmail } from './email.js';
+import { sendOtpSms } from './fast2sms.js';
+import { sendPhoneOtpViaMsg91, verifyPhoneOtpViaMsg91 } from './msg91.js';
+
+// MSG91 requires its own fresh entity/header/template registration through
+// their own platform — no advantage over just fixing Fast2SMS's branding
+// (the WATMCH registration already in motion). Phone OTP stays here.
+const USE_MSG91_FOR_PHONE = false;
 
 export type OtpChannel = 'email' | 'phone';
 
@@ -49,12 +55,18 @@ export async function sendOtp(channel: OtpChannel, identifier: string): Promise<
     return { ok: false, reason: 'rate_limited' };
   }
 
-  const otp = String(Math.floor(1000 + Math.random() * 9000));
-  console.log(`OTP for ${channel}:${identifier} is ${otp}`);
-  await redis.set(otpKey(channel, identifier), otp, 'EX', OTP_TTL_SECONDS);
   await redis.del(attemptsKey(channel, identifier));
   await redis.set(cooldownKey(channel, identifier), '1', 'EX', OTP_RESEND_COOLDOWN_SECONDS);
 
+  if (channel === 'phone' && USE_MSG91_FOR_PHONE) {
+    // MSG91 generates and tracks the actual code on their end — nothing to store here.
+    await sendPhoneOtpViaMsg91(identifier);
+    return { ok: true };
+  }
+
+  const otp = String(Math.floor(1000 + Math.random() * 9000));
+  console.log(`OTP for ${channel}:${identifier} is ${otp}`);
+  await redis.set(otpKey(channel, identifier), otp, 'EX', OTP_TTL_SECONDS);
   if (channel === 'phone') {
     await sendOtpSms(identifier, otp);
   } else {
@@ -68,21 +80,31 @@ export type VerifyOtpResult =
   | { ok: false; reason: 'invalid' }
   | { ok: false; reason: 'too_many_attempts' };
 
+async function trackFailedAttempt(channel: OtpChannel, identifier: string): Promise<VerifyOtpResult> {
+  const attempts = await redis.incr(attemptsKey(channel, identifier));
+  if (attempts === 1) {
+    await redis.expire(attemptsKey(channel, identifier), OTP_TTL_SECONDS);
+  }
+  if (attempts >= OTP_MAX_VERIFY_ATTEMPTS) {
+    await redis.del(attemptsKey(channel, identifier));
+    return { ok: false, reason: 'too_many_attempts' };
+  }
+  return { ok: false, reason: 'invalid' };
+}
+
 export async function verifyOtp(channel: OtpChannel, identifier: string, otp: string): Promise<VerifyOtpResult> {
+  if (channel === 'phone' && USE_MSG91_FOR_PHONE) {
+    const matched = await verifyPhoneOtpViaMsg91(identifier, otp);
+    if (!matched) return trackFailedAttempt(channel, identifier);
+    await redis.del(attemptsKey(channel, identifier));
+    await redis.set(verifiedKey(channel, identifier), '1', 'EX', OTP_TTL_SECONDS);
+    return { ok: true };
+  }
+
   const key = otpKey(channel, identifier);
   const stored = await redis.get(key);
-
   if (!stored || stored !== otp) {
-    const attempts = await redis.incr(attemptsKey(channel, identifier));
-    if (attempts === 1) {
-      await redis.expire(attemptsKey(channel, identifier), OTP_TTL_SECONDS);
-    }
-    if (attempts >= OTP_MAX_VERIFY_ATTEMPTS) {
-      await redis.del(key);
-      await redis.del(attemptsKey(channel, identifier));
-      return { ok: false, reason: 'too_many_attempts' };
-    }
-    return { ok: false, reason: 'invalid' };
+    return trackFailedAttempt(channel, identifier);
   }
 
   await redis.del(key);

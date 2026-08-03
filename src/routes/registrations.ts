@@ -2,17 +2,10 @@ import { Router } from 'express';
 import { GeneratorRegistration } from '../models/GeneratorRegistration.js';
 import { CIRegistration } from '../models/CIRegistration.js';
 import { handleCreateError } from '../lib/handleCreateError.js';
-import { isVerified, clearVerified } from '../services/otpService.js';
+import { sendRegistrationConfirmationEmail } from '../services/email.js';
 import { isValidEmail, isValidIndianPhone, isPositiveNumber } from '../lib/validators.js';
 
 const router = Router();
-
-async function requireVerifiedContact(email: string, phone: string): Promise<string | null> {
-  const [emailOk, phoneOk] = await Promise.all([isVerified('email', email), isVerified('phone', phone)]);
-  if (!emailOk) return 'Email is not verified';
-  if (!phoneOk) return 'Phone is not verified';
-  return null;
-}
 
 router.post('/generator', async (req, res) => {
   try {
@@ -29,14 +22,10 @@ router.post('/generator', async (req, res) => {
     if (!isPositiveNumber(capacity)) {
       return res.status(400).json({ success: false, error: 'Capacity must be a positive number' });
     }
-    const verificationError = await requireVerifiedContact(email, phone);
-    if (verificationError) {
-      return res.status(400).json({ success: false, error: verificationError });
-    }
     const registration = await GeneratorRegistration.create({
       name, company, email, phone, state, capacity, siteLocation, commissioningTimeline, certifications, message,
     });
-    await Promise.all([clearVerified('email', email), clearVerified('phone', phone)]);
+    void sendRegistrationConfirmationEmail(email, name, 'generator');
     res.status(201).json({ success: true, message: 'Generator registration saved successfully', id: registration.id, createdAt: registration.createdAt });
   } catch (err) {
     console.error('Failed to save generator registration:', err);
@@ -65,15 +54,11 @@ router.post('/ci', async (req, res) => {
     if (tenurePreference && !isPositiveNumber(tenurePreference)) {
       return res.status(400).json({ success: false, error: 'Preferred tenure must be a positive number of years' });
     }
-    const verificationError = await requireVerifiedContact(email, phone);
-    if (verificationError) {
-      return res.status(400).json({ success: false, error: verificationError });
-    }
     const registration = await CIRegistration.create({
       name, company, email, phone, state, load, siteLocation, targetCapacity, tenurePreference, message,
       consentGiven: true, consentGivenAt: new Date(),
     });
-    await Promise.all([clearVerified('email', email), clearVerified('phone', phone)]);
+    void sendRegistrationConfirmationEmail(email, name, 'ci');
     res.status(201).json({ success: true, message: 'CI registration saved successfully', id: registration.id, createdAt: registration.createdAt });
   } catch (err) {
     console.error('Failed to save CI registration:', err);
