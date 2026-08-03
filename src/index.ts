@@ -2,9 +2,12 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { sequelize } from './db/sequelize.js';
+import { redis } from './lib/redis.js';
 import leadsRouter from './routes/leads.js';
 import contactRouter from './routes/contact.js';
 import adminRouter from './routes/admin.js';
+import otpRouter from './routes/otp.js';
+import registrationsRouter from './routes/registrations.js';
 
 const app = express();
 const port = process.env.PORT ?? 4000;
@@ -24,6 +27,8 @@ app.get('/api/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/leads', leadsRouter);
 app.use('/api/contact', contactRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/otp', otpRouter);
+app.use('/api/registrations', registrationsRouter);
 
 app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error(`[${new Date().toISOString()}] Unhandled error on ${req.method} ${req.originalUrl}:`, err);
@@ -36,6 +41,11 @@ async function start() {
     console.log('MySQL connected');
   } catch (err) {
     console.error('Could not connect to MySQL — check DB_HOST/DB_USER/DB_PASSWORD/DB_NAME in .env.', err);
+  }
+  try {
+    await redis.ping();
+  } catch (err) {
+    console.error('Could not connect to Redis — check REDIS_HOST/REDIS_PORT/REDIS_PASSWORD in .env. OTP send/verify will fail.', err);
   }
   app.listen(port, () => console.log(`Wattmatch server listening on port ${port}`));
 }
