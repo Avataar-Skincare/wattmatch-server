@@ -6,7 +6,9 @@ import { redis } from './lib/redis.js';
 import leadsRouter from './routes/leads.js';
 import contactRouter from './routes/contact.js';
 import adminRouter from './routes/admin.js';
-import otpRouter from './routes/otp.js';
+// OTP verification was removed from the registration flow — route kept
+// commented out (routes/otp.ts) in case it's reintroduced later.
+// import otpRouter from './routes/otp.js';
 import registrationsRouter from './routes/registrations.js';
 
 const app = express();
@@ -27,7 +29,7 @@ app.get('/api/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/leads', leadsRouter);
 app.use('/api/contact', contactRouter);
 app.use('/api/admin', adminRouter);
-app.use('/api/otp', otpRouter);
+// app.use('/api/otp', otpRouter);
 app.use('/api/registrations', registrationsRouter);
 
 app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {

@@ -10,6 +10,7 @@ export class CIRegistration extends Model<
   declare company: string;
   declare email: string;
   declare phone: string;
+  declare phoneCountryCode: string;
   declare state: string;
   declare load: string;
   declare siteLocation: string | null;
@@ -29,6 +30,7 @@ CIRegistration.init(
     company: { type: DataTypes.STRING, allowNull: false },
     email: { type: DataTypes.STRING, allowNull: false },
     phone: { type: DataTypes.STRING, allowNull: false },
+    phoneCountryCode: { type: DataTypes.STRING, allowNull: false, defaultValue: '+91' },
     state: { type: DataTypes.STRING, allowNull: false },
     load: { type: DataTypes.STRING, allowNull: false },
     siteLocation: { type: DataTypes.STRING, allowNull: true },
