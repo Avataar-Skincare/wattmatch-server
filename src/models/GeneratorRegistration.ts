@@ -1,7 +1,10 @@
 import { DataTypes, Model, type CreationOptional, type InferAttributes, type InferCreationAttributes } from 'sequelize';
 import { sequelize } from '../db/sequelize.js';
 
-export class CILead extends Model<InferAttributes<CILead>, InferCreationAttributes<CILead>> {
+export class GeneratorRegistration extends Model<
+  InferAttributes<GeneratorRegistration>,
+  InferCreationAttributes<GeneratorRegistration>
+> {
   declare id: CreationOptional<number>;
   declare name: string;
   declare company: string;
@@ -9,13 +12,16 @@ export class CILead extends Model<InferAttributes<CILead>, InferCreationAttribut
   declare phone: string;
   declare phoneCountryCode: string;
   declare state: string;
-  declare load: string | null;
+  declare capacity: string;
+  declare siteLocation: string | null;
+  declare commissioningTimeline: string | null;
+  declare certifications: string | null;
   declare message: string | null;
   declare readonly createdAt: CreationOptional<Date>;
   declare readonly updatedAt: CreationOptional<Date>;
 }
 
-CILead.init(
+GeneratorRegistration.init(
   {
     id: { type: DataTypes.INTEGER.UNSIGNED, autoIncrement: true, primaryKey: true },
     name: { type: DataTypes.STRING, allowNull: false },
@@ -24,14 +30,17 @@ CILead.init(
     phone: { type: DataTypes.STRING, allowNull: false },
     phoneCountryCode: { type: DataTypes.STRING, allowNull: false, defaultValue: '+91' },
     state: { type: DataTypes.STRING, allowNull: false },
-    load: { type: DataTypes.STRING, allowNull: true },
+    capacity: { type: DataTypes.STRING, allowNull: false },
+    siteLocation: { type: DataTypes.STRING, allowNull: true },
+    commissioningTimeline: { type: DataTypes.STRING, allowNull: true },
+    certifications: { type: DataTypes.TEXT, allowNull: true },
     message: { type: DataTypes.TEXT, allowNull: true },
     createdAt: DataTypes.DATE,
     updatedAt: DataTypes.DATE,
   },
   {
     sequelize,
-    tableName: 'wattmatch_ci_leads',
+    tableName: 'wattmatch_generator_registrations',
     underscored: true,
   }
 );

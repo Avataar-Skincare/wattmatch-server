@@ -2,6 +2,8 @@ import { Router } from 'express';
 import { CILead } from '../models/CILead.js';
 import { GeneratorLead } from '../models/GeneratorLead.js';
 import { ContactMessage } from '../models/ContactMessage.js';
+import { CIRegistration } from '../models/CIRegistration.js';
+import { GeneratorRegistration } from '../models/GeneratorRegistration.js';
 
 const router = Router();
 const DEFAULT_LIMIT = 20;
@@ -25,6 +27,16 @@ router.get('/leads/generator', async (req, res) => {
 
 router.get('/contact', async (req, res) => {
   const rows = await ContactMessage.findAll({ order: [['id', 'DESC']], limit: parseLimit(req) });
+  res.json(rows);
+});
+
+router.get('/registrations/ci', async (req, res) => {
+  const rows = await CIRegistration.findAll({ order: [['id', 'DESC']], limit: parseLimit(req) });
+  res.json(rows);
+});
+
+router.get('/registrations/generator', async (req, res) => {
+  const rows = await GeneratorRegistration.findAll({ order: [['id', 'DESC']], limit: parseLimit(req) });
   res.json(rows);
 });
 
