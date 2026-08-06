@@ -10,13 +10,13 @@ const router = Router();
 router.post('/generator', async (req, res) => {
   try {
     const { name, company, email, phone, state, capacity, siteLocation, commissioningTimeline, certifications, message } = req.body;
-    if (!name || !company || !email || !phone || !state || !capacity || !siteLocation || !commissioningTimeline || !certifications) {
+    if (!email || !phone) {
       return res.status(400).json({ success: false, error: 'Missing required fields' });
     }
     if (!isValidEmail(email)) {
       return res.status(400).json({ success: false, error: 'Enter a valid email address' });
     }
-    if (!isPositiveNumber(capacity)) {
+    if (capacity && !isPositiveNumber(capacity)) {
       return res.status(400).json({ success: false, error: 'Capacity must be a positive number' });
     }
     if (!isValidPhone(phone)) {
@@ -24,7 +24,8 @@ router.post('/generator', async (req, res) => {
     }
     const { countryCode, number } = normalizePhone(phone);
     const registration = await GeneratorRegistration.create({
-      name, company, email, phone: number, phoneCountryCode: countryCode, state, capacity, siteLocation, commissioningTimeline, certifications, message,
+      name: name || '', company: company || '', email, phone: number, phoneCountryCode: countryCode,
+      state: state || '', capacity: capacity || '', siteLocation, commissioningTimeline, certifications, message,
     });
     void sendRegistrationConfirmationEmail(email, 'generator');
     res.status(201).json({ success: true, message: 'Generator registration saved successfully', id: registration.id, createdAt: registration.createdAt });
@@ -37,7 +38,7 @@ router.post('/generator', async (req, res) => {
 router.post('/ci', async (req, res) => {
   try {
     const { name, company, email, phone, state, load, siteLocation, targetCapacity, tenurePreference, message, consent } = req.body;
-    if (!name || !company || !email || !phone || !state || !load || !siteLocation || !targetCapacity) {
+    if (!email || !phone) {
       return res.status(400).json({ success: false, error: 'Missing required fields' });
     }
     if (consent !== true) {
@@ -46,10 +47,10 @@ router.post('/ci', async (req, res) => {
     if (!isValidEmail(email)) {
       return res.status(400).json({ success: false, error: 'Enter a valid email address' });
     }
-    if (!isPositiveNumber(load)) {
+    if (load && !isPositiveNumber(load)) {
       return res.status(400).json({ success: false, error: 'Monthly consumption must be a positive number' });
     }
-    if (!isPositiveNumber(targetCapacity)) {
+    if (targetCapacity && !isPositiveNumber(targetCapacity)) {
       return res.status(400).json({ success: false, error: 'Max demand must be a positive number' });
     }
     if (tenurePreference && !isPositiveNumber(tenurePreference)) {
@@ -60,7 +61,8 @@ router.post('/ci', async (req, res) => {
     }
     const { countryCode, number } = normalizePhone(phone);
     const registration = await CIRegistration.create({
-      name, company, email, phone: number, phoneCountryCode: countryCode, state, load, siteLocation, targetCapacity, tenurePreference, message,
+      name: name || '', company: company || '', email, phone: number, phoneCountryCode: countryCode,
+      state: state || '', load: load || '', siteLocation, targetCapacity, tenurePreference, message,
       consentGiven: true, consentGivenAt: new Date(),
     });
     void sendRegistrationConfirmationEmail(email, 'ci');
