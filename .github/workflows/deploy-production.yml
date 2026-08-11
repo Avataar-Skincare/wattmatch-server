@@ -1,0 +1,32 @@
+name: Deploy Wattmatch Server — Production
+
+# Mirrors threads-chatbot-server's deploy pattern: push to main -> SSH into EC2 ->
+# pull + install + build + migrate + pm2 restart.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /home/ec2-user/opt/projects/Avataar-Skincare/wattmatch-server &&
+            git pull origin main &&
+            npm ci &&
+            npm run build &&
+            npm run migrate &&
+            pm2 restart wattmatch
