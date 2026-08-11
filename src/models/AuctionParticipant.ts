@@ -1,0 +1,38 @@
+import { DataTypes, Model, type CreationOptional, type InferAttributes, type InferCreationAttributes } from 'sequelize';
+import { sequelize } from '../db/sequelize.js';
+
+// PoC scope: real identity fields are plaintext (organizationName), not KMS-encrypted — see
+// AUCTION_MVP_PLAN.md's "deliberately out of scope" list. Do not carry this table's shape forward
+// unencrypted once real generator identity is involved.
+export class AuctionParticipant extends Model<InferAttributes<AuctionParticipant>, InferCreationAttributes<AuctionParticipant>> {
+  declare id: CreationOptional<number>;
+  declare auctionId: number;
+  declare organizationName: string;
+  declare alias: string;
+  // Unique per generator, not single-use — stays valid for the auction's duration so a dropped
+  // participant can reconnect with the same link. Embedded as the JWT's `jti` claim.
+  declare joinTokenId: string;
+  // Set once this participant explicitly acknowledges the auction rules (incl. the non-binding
+  // disclosure) — bidding is gated on this being non-null, not just shown as a UI formality.
+  declare rulesAcceptedAt: Date | null;
+  declare readonly createdAt: CreationOptional<Date>;
+  declare readonly updatedAt: CreationOptional<Date>;
+}
+
+AuctionParticipant.init(
+  {
+    id: { type: DataTypes.INTEGER.UNSIGNED, autoIncrement: true, primaryKey: true },
+    auctionId: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false },
+    organizationName: { type: DataTypes.STRING, allowNull: false },
+    alias: { type: DataTypes.STRING, allowNull: false },
+    joinTokenId: { type: DataTypes.STRING, allowNull: false, unique: true },
+    rulesAcceptedAt: { type: DataTypes.DATE, allowNull: true },
+    createdAt: DataTypes.DATE,
+    updatedAt: DataTypes.DATE,
+  },
+  {
+    sequelize,
+    tableName: 'wattmatch_auction_participants',
+    underscored: true,
+  }
+);
