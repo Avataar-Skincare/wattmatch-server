@@ -10,6 +10,23 @@ import { DEPLOYED_CODE_VERSION } from '../lib/version.js';
 // current lowest bid. This is a flat platform rule, not per-auction configurable.
 export const MIN_UNDERCUT = 0.01;
 
+// Sanity bounds on a bid amount — the Lua script only checks a bid is below the current lowest,
+// with no floor, so a negative or absurd amount would otherwise be silently ACCEPTED as a valid
+// leading bid. The upper bound also keeps amounts within what the AuctionBid/AuctionBidAudit
+// DECIMAL(10,4) column can actually store — an out-of-range value would otherwise throw on the DB
+// insert well after Redis has already been updated with it (see appendAuditedBid).
+export const MAX_BID_AMOUNT = 999999;
+
+// For logging a REJECTED bid attempt whose amount is itself invalid (non-finite, negative, or
+// too large) — the raw value can't just be passed to appendAuditedBid as-is, since an
+// out-of-range amount would overflow the exact same DECIMAL(10,4) column the rejection is trying
+// to record, turning a clean "rejected: invalid amount" into an unhandled DB error instead.
+// Clamping preserves some signal (how far out of range the attempt was) without risking that.
+export function sanitizeAmountForAudit(amount: number): string {
+  if (!Number.isFinite(amount)) return '0';
+  return String(Math.max(-MAX_BID_AMOUNT, Math.min(MAX_BID_AMOUNT, amount)));
+}
+
 // Fixed platform-wide disclosure, not a per-auction toggle — see REGULATORY_CERTIFICATION_RESEARCH.md's
 // "Recommended regulatory position": keeping the auction output non-binding is the lowest-risk
 // structure for the CERC classification question. Deliberately not configurable per auction so

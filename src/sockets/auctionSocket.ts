@@ -12,6 +12,8 @@ import {
   releaseAuctionLock,
   RESULT_TYPE,
   RESULT_DISCLOSURE,
+  MAX_BID_AMOUNT,
+  sanitizeAmountForAudit,
 } from '../services/auctionEngine.js';
 
 // Single recurring poll, not a per-bid setTimeout reschedule — avoids Node event-loop-lag drift
@@ -101,58 +103,70 @@ export function setupAuctionSocket(httpServer: HTTPServer) {
       const amount = Number(payload?.amount);
       const ipHash = hashIp(socket.handshake.address);
 
-      // Every attempt is logged, including ones blocked before reaching the Redis compare-and-swap
-      // — a rules-not-accepted or malformed-amount attempt is still a real audit-worthy event, not
-      // just noise to discard (same principle as logging market-rejected bids).
-      if (!socket.data.rulesAccepted) {
+      // Everything below can throw (a DB write, Redis) — without this, an unhandled rejection in
+      // an async socket handler crashes the whole process (Node terminates on unhandled rejection
+      // by default), taking down every other live auction along with it, not just this one bid.
+      try {
+        // Every attempt is logged, including ones blocked before reaching the Redis compare-and-swap
+        // — a rules-not-accepted or malformed-amount attempt is still a real audit-worthy event, not
+        // just noise to discard (same principle as logging market-rejected bids).
+        if (!socket.data.rulesAccepted) {
+          await appendAuditedBid({
+            auctionId,
+            participantId,
+            alias,
+            amount: sanitizeAmountForAudit(amount),
+            accepted: false,
+            rejectReason: 'RULES_NOT_ACCEPTED',
+            ipHash,
+          });
+          socket.emit('bid:rejected', { reason: 'RULES_NOT_ACCEPTED' });
+          return;
+        }
+
+        // The Lua script only checks a bid is below the current lowest — with no floor or ceiling,
+        // a negative amount would otherwise be accepted as a valid leading bid, and an amount
+        // outside DECIMAL(10,4)'s range would throw on the DB insert below instead of being caught
+        // here cleanly.
+        if (!Number.isFinite(amount) || amount <= 0 || amount > MAX_BID_AMOUNT) {
+          await appendAuditedBid({
+            auctionId,
+            participantId,
+            alias,
+            amount: sanitizeAmountForAudit(amount),
+            accepted: false,
+            rejectReason: 'INVALID_AMOUNT',
+            ipHash,
+          });
+          socket.emit('bid:rejected', { reason: 'INVALID_AMOUNT' });
+          return;
+        }
+
+        const result = await submitBid(auctionId, amount, participantId, alias);
+
         await appendAuditedBid({
           auctionId,
           participantId,
           alias,
-          amount: String(Number.isFinite(amount) ? amount : 0),
-          accepted: false,
-          rejectReason: 'RULES_NOT_ACCEPTED',
+          amount: String(amount),
+          accepted: result.accepted,
+          rejectReason: result.accepted ? null : result.reason,
           ipHash,
         });
-        socket.emit('bid:rejected', { reason: 'RULES_NOT_ACCEPTED' });
-        return;
-      }
 
-      if (!Number.isFinite(amount)) {
-        await appendAuditedBid({
-          auctionId,
-          participantId,
-          alias,
-          amount: '0',
-          accepted: false,
-          rejectReason: 'INVALID_AMOUNT',
-          ipHash,
-        });
-        socket.emit('bid:rejected', { reason: 'INVALID_AMOUNT' });
-        return;
-      }
-
-      const result = await submitBid(auctionId, amount, participantId, alias);
-
-      await appendAuditedBid({
-        auctionId,
-        participantId,
-        alias,
-        amount: String(amount),
-        accepted: result.accepted,
-        rejectReason: result.accepted ? null : result.reason,
-        ipHash,
-      });
-
-      if (result.accepted) {
-        await Auction.update({ currentLowestBid: String(result.currentBid) }, { where: { id: auctionId } });
-        io.to(room).emit('state:update', {
-          currentBid: result.currentBid,
-          windowEndsAt: result.windowEndsAt,
-          alias,
-        });
-      } else {
-        socket.emit('bid:rejected', { reason: result.reason, currentBid: result.currentBid });
+        if (result.accepted) {
+          await Auction.update({ currentLowestBid: String(result.currentBid) }, { where: { id: auctionId } });
+          io.to(room).emit('state:update', {
+            currentBid: result.currentBid,
+            windowEndsAt: result.windowEndsAt,
+            alias,
+          });
+        } else {
+          socket.emit('bid:rejected', { reason: result.reason, currentBid: result.currentBid });
+        }
+      } catch (err) {
+        console.error(`[AUCTION_BID] auction=${auctionId} participant=${participantId} unexpected error:`, err);
+        socket.emit('bid:rejected', { reason: 'INTERNAL_ERROR' });
       }
     });
   });
@@ -162,26 +176,52 @@ export function setupAuctionSocket(httpServer: HTTPServer) {
 }
 
 function startCloseCheckLoop(io: SocketIOServer) {
-  setInterval(async () => {
-    const liveAuctions = await Auction.findAll({ where: { status: 'live' } });
-    for (const auction of liveAuctions) {
-      const state = await getAuctionState(auction.id);
-      if (!state || state.windowEndsAt === null) continue;
-      if (Date.now() < state.windowEndsAt) continue;
+  // A recursive setTimeout, not setInterval — the next tick is only scheduled once this one fully
+  // finishes. With 20 concurrent auctions each needing several sequential DB calls to close, a
+  // single tick can plausibly run past 500ms; setInterval would then start an overlapping tick
+  // that still sees the not-yet-committed 'live' status and closes the same auction a second time
+  // (double result summary, double auction:closed broadcast). This also means one auction's error
+  // can't wedge every future tick — it's caught per-auction below, not just per-tick.
+  async function tick() {
+    try {
+      const liveAuctions = await Auction.findAll({ where: { status: 'live' } });
+      for (const auction of liveAuctions) {
+        try {
+          const state = await getAuctionState(auction.id);
+          // A missing Redis state for a DB row that says 'live' means Redis lost the key (a
+          // restart without persistence, eviction, etc.) — without this log line, such an auction
+          // would just silently sit 'live' forever with no way to close, since nothing else here
+          // treats that as unusual. (windowEndsAt === null is a separate, normal case: the brief
+          // moment between initAuctionState and startAuctionClock at seed time.)
+          if (!state) {
+            console.error(`[AUCTION_CLOSE] auction=${auction.id} is 'live' in the DB but has no Redis state — stuck, cannot close automatically.`);
+            continue;
+          }
+          if (state.windowEndsAt === null) continue;
+          if (Date.now() < state.windowEndsAt) continue;
 
-      await markAuctionClosed(auction.id);
-      await Auction.update(
-        { status: 'closed', winnerParticipantId: state.leaderParticipantId },
-        { where: { id: auction.id } }
-      );
-      await buildAndStoreResultSummary(auction.id, state.leaderParticipantId, state.leaderAlias, state.currentBid);
-      io.to(`auction:${auction.id}`).emit('auction:closed', {
-        winnerAlias: state.leaderAlias,
-        winningBid: state.currentBid,
-        resultType: RESULT_TYPE,
-        disclosure: RESULT_DISCLOSURE,
-      });
-      releaseAuctionLock(auction.id);
+          await markAuctionClosed(auction.id);
+          await Auction.update(
+            { status: 'closed', winnerParticipantId: state.leaderParticipantId },
+            { where: { id: auction.id } }
+          );
+          await buildAndStoreResultSummary(auction.id, state.leaderParticipantId, state.leaderAlias, state.currentBid);
+          io.to(`auction:${auction.id}`).emit('auction:closed', {
+            winnerAlias: state.leaderAlias,
+            winningBid: state.currentBid,
+            resultType: RESULT_TYPE,
+            disclosure: RESULT_DISCLOSURE,
+          });
+          releaseAuctionLock(auction.id);
+        } catch (err) {
+          console.error(`[AUCTION_CLOSE] auction=${auction.id} failed to close:`, err);
+        }
+      }
+    } catch (err) {
+      console.error('[AUCTION_CLOSE] close-check tick failed:', err);
+    } finally {
+      setTimeout(tick, CLOSE_CHECK_INTERVAL_MS);
     }
-  }, CLOSE_CHECK_INTERVAL_MS);
+  }
+  setTimeout(tick, CLOSE_CHECK_INTERVAL_MS);
 }
