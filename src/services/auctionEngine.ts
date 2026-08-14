@@ -132,6 +132,29 @@ export async function startAuctionClock(auctionId: number, windowSeconds: number
   return windowEndsAt;
 }
 
+// Restart resilience: rebuilds a 'live' auction's Redis state from its own MySQL row when Redis has
+// lost it (a restart without persistence configured, or an eviction) — without this, the close-check
+// loop in auctionSocket.ts finds a DB row that says 'live' with nothing in Redis to act on, and the
+// auction sits stuck forever with no automatic path to close. Resumes from the last known price and
+// leader (both mirrored into MySQL on every accepted bid — see the Auction model's own comment on
+// currentLeaderParticipantId), not the original opening bid, so a recovered auction reflects real
+// market state instead of silently discarding every bid placed before the state was lost. Two
+// things are deliberately NOT recoverable this way and are accepted as the cost of this being a
+// PoC without a fully durable event log: the extension count resets to 0 (generators get the
+// benefit of the doubt after an infra hiccup rather than an unfair head start toward closing), and
+// a brand new full window starts from now rather than whatever time was actually left.
+export async function reconstructAuctionState(auction: Auction): Promise<void> {
+  const resumeBid = Number(auction.currentLowestBid ?? auction.openingBid);
+  await initAuctionState(auction.id, resumeBid, auction.windowSeconds, auction.maxAutoExtensions, Number(auction.minUndercut));
+  if (auction.currentLeaderParticipantId !== null) {
+    await redis.hset(auctionKey(auction.id), {
+      leaderParticipantId: String(auction.currentLeaderParticipantId),
+      leaderAlias: auction.currentLeaderAlias ?? '',
+    });
+  }
+  await startAuctionClock(auction.id, auction.windowSeconds);
+}
+
 export async function submitBid(auctionId: number, amount: number, participantId: number, alias: string) {
   const [outcome, valueOrReason, extra] = await redis.submitBid(
     auctionKey(auctionId),

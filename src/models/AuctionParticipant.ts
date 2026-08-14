@@ -1,6 +1,8 @@
 import { DataTypes, Model, type CreationOptional, type InferAttributes, type InferCreationAttributes } from 'sequelize';
 import { sequelize } from '../db/sequelize.js';
 
+export type AuctionParticipantRole = 'generator' | 'buyer';
+
 // PoC scope: real identity fields are plaintext (organizationName), not KMS-encrypted — see
 // AUCTION_MVP_PLAN.md's "deliberately out of scope" list. Do not carry this table's shape forward
 // unencrypted once real generator identity is involved.
@@ -9,6 +11,10 @@ export class AuctionParticipant extends Model<InferAttributes<AuctionParticipant
   declare auctionId: number;
   declare organizationName: string;
   declare alias: string;
+  // 'buyer' is a read-only spectator seat — same alias-only exposure and join-token mechanism as a
+  // generator, just never allowed to submit a bid (enforced server-side in auctionSocket.ts, not
+  // just hidden client-side). Defaults to 'generator' so every pre-existing row stays valid.
+  declare role: CreationOptional<AuctionParticipantRole>;
   // Unique per generator, not single-use — stays valid for the auction's duration so a dropped
   // participant can reconnect with the same link. Embedded as the JWT's `jti` claim.
   declare joinTokenId: string;
@@ -25,6 +31,7 @@ AuctionParticipant.init(
     auctionId: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false },
     organizationName: { type: DataTypes.STRING, allowNull: false },
     alias: { type: DataTypes.STRING, allowNull: false },
+    role: { type: DataTypes.ENUM('generator', 'buyer'), allowNull: false, defaultValue: 'generator' },
     joinTokenId: { type: DataTypes.STRING, allowNull: false, unique: true },
     rulesAcceptedAt: { type: DataTypes.DATE, allowNull: true },
     createdAt: DataTypes.DATE,

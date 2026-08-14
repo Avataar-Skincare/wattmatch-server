@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import http from 'node:http';
+import crypto from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
 import { sequelize } from './db/sequelize.js';
@@ -21,10 +22,25 @@ const port = process.env.PORT ?? 4000;
 app.use(cors({ origin: process.env.CORS_ORIGIN ?? 'http://localhost:5173' }));
 app.use(express.json());
 
+// CERT-In floor: log lines need a consistent correlation ID so one bid submission (or any other
+// request) can be traced end-to-end across services from logs alone — see AUCTION_PLAN.md/
+// COMPLIANCE_CHECKLIST.md. Generated fresh per request rather than trusting an inbound header,
+// since a caller-supplied ID could be used to collide with or spoof another request's trace.
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace Express {
+    interface Request {
+      requestId: string;
+    }
+  }
+}
+
 app.use((req, res, next) => {
+  req.requestId = crypto.randomBytes(8).toString('hex');
+  res.setHeader('X-Request-Id', req.requestId);
   const start = Date.now();
   res.on('finish', () => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - start}ms`);
+    console.log(`[${new Date().toISOString()}] [req=${req.requestId}] ${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - start}ms`);
   });
   next();
 });
@@ -40,8 +56,8 @@ app.use('/api/registrations', registrationsRouter);
 app.use('/api/auction-admin', auctionAdminRouter);
 
 app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  console.error(`[${new Date().toISOString()}] Unhandled error on ${req.method} ${req.originalUrl}:`, err);
-  res.status(500).json({ error: 'Internal server error' });
+  console.error(`[${new Date().toISOString()}] [req=${req.requestId}] Unhandled error on ${req.method} ${req.originalUrl}:`, err);
+  res.status(500).json({ error: 'Internal server error', requestId: req.requestId });
 });
 
 async function start() {

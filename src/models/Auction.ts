@@ -12,6 +12,13 @@ export class Auction extends Model<InferAttributes<Auction>, InferCreationAttrib
   declare openingBid: string;
   // Display/reporting mirror only — Redis, not this column, decides bid acceptance.
   declare currentLowestBid: string | null;
+  // Mirrors of Redis's leaderParticipantId/leaderAlias, written on every accepted bid — restart
+  // resilience: if Redis state is ever lost mid-auction (restart without persistence, eviction),
+  // these are what let the auction be reconstructed with the correct current leader instead of
+  // silently resuming with nobody leading, which would let it close with no winner despite one
+  // having actually existed. See auctionEngine.ts's reconstructAuctionState.
+  declare currentLeaderParticipantId: number | null;
+  declare currentLeaderAlias: string | null;
   declare windowSeconds: number;
   declare maxAutoExtensions: number;
   // Rule-version tracking: snapshots the platform-wide MIN_UNDERCUT constant (auctionEngine.ts) at
@@ -39,6 +46,8 @@ Auction.init(
     status: { type: DataTypes.ENUM('scheduled', 'live', 'closed'), allowNull: false, defaultValue: 'scheduled' },
     openingBid: { type: DataTypes.DECIMAL(10, 4), allowNull: false },
     currentLowestBid: { type: DataTypes.DECIMAL(10, 4), allowNull: true },
+    currentLeaderParticipantId: { type: DataTypes.INTEGER.UNSIGNED, allowNull: true },
+    currentLeaderAlias: { type: DataTypes.STRING, allowNull: true },
     windowSeconds: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false, defaultValue: 480 },
     maxAutoExtensions: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false, defaultValue: 8 },
     minUndercut: { type: DataTypes.DECIMAL(10, 4), allowNull: false, defaultValue: 0.01 },
