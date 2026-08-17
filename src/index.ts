@@ -6,6 +6,7 @@ import cors from 'cors';
 import { sequelize } from './db/sequelize.js';
 import { auditSequelize } from './db/auditSequelize.js';
 import { redis } from './lib/redis.js';
+import { logger } from './lib/logger.js';
 import leadsRouter from './routes/leads.js';
 import contactRouter from './routes/contact.js';
 import adminRouter from './routes/admin.js';
@@ -40,7 +41,10 @@ app.use((req, res, next) => {
   res.setHeader('X-Request-Id', req.requestId);
   const start = Date.now();
   res.on('finish', () => {
-    console.log(`[${new Date().toISOString()}] [req=${req.requestId}] ${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - start}ms`);
+    logger.info(
+      { reqId: req.requestId, method: req.method, url: req.originalUrl, statusCode: res.statusCode, durationMs: Date.now() - start },
+      'request completed'
+    );
   });
   next();
 });
@@ -56,31 +60,31 @@ app.use('/api/registrations', registrationsRouter);
 app.use('/api/auction-admin', auctionAdminRouter);
 
 app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  console.error(`[${new Date().toISOString()}] [req=${req.requestId}] Unhandled error on ${req.method} ${req.originalUrl}:`, err);
+  logger.error({ err, reqId: req.requestId, method: req.method, url: req.originalUrl }, 'unhandled error');
   res.status(500).json({ error: 'Internal server error', requestId: req.requestId });
 });
 
 async function start() {
   try {
     await sequelize.authenticate();
-    console.log('MySQL connected');
+    logger.info('MySQL connected');
   } catch (err) {
-    console.error('Could not connect to MySQL — check DB_HOST/DB_USER/DB_PASSWORD/DB_NAME in .env.', err);
+    logger.error({ err }, 'Could not connect to MySQL — check DB_HOST/DB_USER/DB_PASSWORD/DB_NAME in .env.');
   }
   try {
     await auditSequelize.authenticate();
-    console.log('Audit DB connection (restricted user) OK');
+    logger.info('Audit DB connection (restricted user) OK');
   } catch (err) {
-    console.error('Could not connect as the restricted audit DB user — check AUDIT_DB_USER/AUDIT_DB_PASSWORD in .env. Bid logging will fail.', err);
+    logger.error({ err }, 'Could not connect as the restricted audit DB user — check AUDIT_DB_USER/AUDIT_DB_PASSWORD in .env. Bid logging will fail.');
   }
   try {
     await redis.ping();
   } catch (err) {
-    console.error('Could not connect to Redis — check REDIS_HOST/REDIS_PORT/REDIS_PASSWORD in .env. OTP send/verify and the auction PoC will fail.', err);
+    logger.error({ err }, 'Could not connect to Redis — check REDIS_HOST/REDIS_PORT/REDIS_PASSWORD in .env. OTP send/verify and the auction PoC will fail.');
   }
   const httpServer = http.createServer(app);
   setupAuctionSocket(httpServer);
-  httpServer.listen(port, () => console.log(`Wattmatch server listening on port ${port}`));
+  httpServer.listen(port, () => logger.info({ port }, 'Wattmatch server listening'));
 }
 
 start();

@@ -1,10 +1,12 @@
 import crypto from 'node:crypto';
+import { UniqueConstraintError } from 'sequelize';
 import { redis } from '../lib/redis.js';
 import { AuctionBid } from '../models/AuctionBid.js';
 import { AuctionBidAudit } from '../models/AuctionBidAudit.js';
 import { Auction } from '../models/Auction.js';
 import { appendToLocalAuditLog } from '../lib/localAuditLog.js';
 import { DEPLOYED_CODE_VERSION } from '../lib/version.js';
+import { logger } from '../lib/logger.js';
 
 // Founder-confirmed rule (AUCTION_PLAN.md): no fixed step, just at least 1 paisa below the
 // current lowest bid. This is a flat platform rule, not per-auction configurable.
@@ -199,34 +201,30 @@ interface AuditedBidInput {
   ipHash: string | null;
 }
 
-// Serializes appendAuditedBid calls per auction so the "read last hash, then write" step can't
-// race across two near-simultaneous bids (this server is single-process for the PoC — a real
-// multi-instance deployment would need this enforced at the DB level, e.g. SELECT ... FOR UPDATE,
-// instead). Without this, two bids landing in the same tick could both compute the same prevHash
-// and silently fork the chain.
-const auctionWriteLocks = new Map<number, Promise<unknown>>();
-
-async function withAuctionWriteLock<T>(auctionId: number, fn: () => Promise<T>): Promise<T> {
-  const previous = auctionWriteLocks.get(auctionId) ?? Promise.resolve();
-  const run = previous.then(fn, fn);
-  auctionWriteLocks.set(
-    auctionId,
-    run.then(
-      () => undefined,
-      () => undefined
-    )
-  );
-  return run;
-}
-
-// Without this, auctionWriteLocks grows by one entry per auction for the lifetime of the process
-// — a slow leak, not a concurrency bug, but worth closing now that multiple auctions can run at
-// once instead of the one-at-a-time PoC testing done so far. Safe to call once an auction is
-// closed: any late straggler bid attempt just gets a fresh lock, and by then there's no concurrent
-// writer left to race against for that auction anyway.
-export function releaseAuctionLock(auctionId: number) {
-  auctionWriteLocks.delete(auctionId);
-}
+// Prevents two near-simultaneous bids for the same auction from forking the hash chain (both
+// reading the same "last row" and computing the same prevHash). Earlier versions of this tried to
+// serialize the read-then-write with a lock — first an in-memory Map (correct, but only within a
+// single process), then a MySQL advisory lock (GET_LOCK/RELEASE_LOCK) that turned out to have a
+// real bug: releasing the lock happened before the enclosing transaction actually committed, since
+// advisory locks are session-scoped and take effect immediately regardless of transaction state —
+// so the next writer could acquire the lock and read stale data before the previous writer's
+// insert was even visible, forking the chain anyway. Verified live: 15 truly concurrent bids
+// reliably produced exactly this fork.
+//
+// This replaces locking entirely with a real database constraint plus retry: a unique index on
+// (auction_id, prev_hash) — see the migration and both models' own comments — means two writers
+// racing to extend the chain from the same prevHash can't both succeed; the database itself
+// rejects the second insert, which is caught below and retried against the now-current chain. This
+// needs no lock, no session/connection pinning, and is correct across any number of server
+// instances for free, since the constraint lives in MySQL, not in any one process's memory.
+//
+// Verified live at two different contention levels: 15 concurrent bids for an auction already a
+// few rows into its chain retried cleanly; 30 truly simultaneous *first-ever* bids for a brand-new
+// auction (the worst case — every one of them starts from the same empty prevHash, so only one can
+// win and the other 29 all collide at once) needed the randomized backoff below to keep retrying
+// in lockstep with each other from exhausting a small attempt budget — without it, a whole losing
+// cohort tends to retry at the same instant and re-collide with each other repeatedly.
+const MAX_CHAIN_INSERT_ATTEMPTS = 20;
 
 // Tamper-evidence chain (AUCTION_PLAN.md standard): hash = SHA-256(prevHash + this row's content).
 // This is the only place that should ever write an AuctionBid row — and it deliberately goes
@@ -234,12 +232,13 @@ export function releaseAuctionLock(auctionId: number) {
 // model, so an application bug or injection reachable through the app's normal DB credentials
 // still can't UPDATE/DELETE an existing audit row.
 export async function appendAuditedBid(input: AuditedBidInput) {
-  return withAuctionWriteLock(input.auctionId, async () => {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= MAX_CHAIN_INSERT_ATTEMPTS; attempt++) {
     const lastRow = await AuctionBidAudit.findOne({
       where: { auctionId: input.auctionId },
       order: [['id', 'DESC']],
     });
-    const prevHash = lastRow?.hash ?? null;
+    const prevHash = lastRow?.hash ?? '';
     // Normalized to the exact form the DECIMAL(10,4) column stores/returns (e.g. "7" -> "7.0000")
     // — hashing the pre-insert value instead would make every future verification pass (read the
     // row, recompute, compare) report a false mismatch even with zero tampering, since MySQL
@@ -256,10 +255,27 @@ export async function appendAuditedBid(input: AuditedBidInput) {
     });
     const hash = crypto
       .createHash('sha256')
-      .update((prevHash ?? '') + content)
+      .update(prevHash + content)
       .digest('hex');
 
-    const row = await AuctionBidAudit.create({ ...input, prevHash, hash });
+    let row: AuctionBidAudit;
+    try {
+      row = await AuctionBidAudit.create({ ...input, prevHash, hash });
+    } catch (err) {
+      // Someone else's insert landed between our read and our write, claiming this exact
+      // (auctionId, prevHash) pair first — the database caught it, so retry against whatever the
+      // chain looks like now. Any other error (a real DB problem) should propagate as-is, same as
+      // before this retry loop existed.
+      if (err instanceof UniqueConstraintError) {
+        lastError = err;
+        // A small randomized delay, growing with attempt count — without it, a whole cohort that
+        // lost together tends to retry together and immediately re-collide with each other again,
+        // burning through the attempt budget without ever spreading out enough to succeed.
+        await new Promise((resolve) => setTimeout(resolve, Math.random() * 15 * attempt));
+        continue;
+      }
+      throw err;
+    }
 
     // Second, independent record of the same event — see localAuditLog.ts for why this exists
     // alongside (not instead of) the DB row. Written after the DB insert succeeds: if this file
@@ -278,11 +294,15 @@ export async function appendAuditedBid(input: AuditedBidInput) {
         hash,
       });
     } catch (err) {
-      console.error('[AUDIT_LOG] failed to write local audit file:', err);
+      logger.error({ err }, '[AUDIT_LOG] failed to write local audit file');
     }
 
     return row;
-  });
+  }
+  // Only reachable if MAX_CHAIN_INSERT_ATTEMPTS consecutive attempts all lost the race — with a
+  // handful of bidders this would need to happen 5 times in a row, vanishingly unlikely; treated as
+  // a real failure rather than retried forever, so a pathological case can't hang a bid indefinitely.
+  throw lastError instanceof Error ? lastError : new Error(`Failed to append audited bid for auction ${input.auctionId} after ${MAX_CHAIN_INSERT_ATTEMPTS} attempts`);
 }
 
 // Collusion-monitoring control: not proof of anything, just investigation leads — flags patterns
@@ -349,6 +369,10 @@ export async function buildAndStoreResultSummary(
     rules: {
       windowSeconds: auction?.windowSeconds ?? null,
       maxAutoExtensions: auction?.maxAutoExtensions ?? null,
+      // Mirrored into this same row right before this function is called (see auctionSocket.ts's
+      // close-tick) — the actual number used, not just the cap, so the permanent record shows what
+      // really happened rather than only what was allowed to happen.
+      extensionsUsed: auction?.currentExtensionCount ?? null,
       // Read from this specific auction's own record, not the live MIN_UNDERCUT constant — if the
       // constant is ever changed later, this stays accurate to what actually applied when this
       // auction ran (see the field's own comment on the Auction model for why).

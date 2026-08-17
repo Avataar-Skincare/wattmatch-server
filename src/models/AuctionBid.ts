@@ -13,10 +13,13 @@ export class AuctionBid extends Model<InferAttributes<AuctionBid>, InferCreation
   declare rejectReason: string | null;
   declare ipHash: string | null;
   // Tamper-evidence chain (AUCTION_PLAN.md standard): hash = SHA-256(prevHash + this row's
-  // content). prevHash is null only for the very first bid row of a given auction. Written by
-  // appendAuditedBid() in auctionEngine.ts — never set directly via AuctionBid.create() elsewhere,
-  // or the chain breaks.
-  declare prevHash: string | null;
+  // content). Empty string ('', not null) for the very first bid row of a given auction —
+  // deliberately not nullable, so the unique (auction_id, prev_hash) index can actually catch two
+  // concurrent "first bid" attempts racing each other (most SQL engines treat every NULL as
+  // distinct from every other NULL in a unique index, so a nullable column wouldn't catch that
+  // specific race at all). Written by appendAuditedBid() in auctionEngine.ts — never set directly
+  // via AuctionBid.create() elsewhere, or the chain breaks.
+  declare prevHash: string;
   declare hash: string;
   declare readonly createdAt: CreationOptional<Date>;
 }
@@ -31,7 +34,7 @@ AuctionBid.init(
     accepted: { type: DataTypes.BOOLEAN, allowNull: false },
     rejectReason: { type: DataTypes.STRING, allowNull: true },
     ipHash: { type: DataTypes.STRING, allowNull: true },
-    prevHash: { type: DataTypes.STRING, allowNull: true },
+    prevHash: { type: DataTypes.STRING, allowNull: false, defaultValue: '' },
     hash: { type: DataTypes.STRING, allowNull: false },
     createdAt: DataTypes.DATE,
   },

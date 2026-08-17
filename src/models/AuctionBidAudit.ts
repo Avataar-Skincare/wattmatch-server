@@ -16,7 +16,10 @@ export class AuctionBidAudit extends Model<InferAttributes<AuctionBidAudit>, Inf
   declare accepted: boolean;
   declare rejectReason: string | null;
   declare ipHash: string | null;
-  declare prevHash: string | null;
+  // Empty string ('', not null) for the very first bid row of a given auction — see AuctionBid's
+  // own comment on why this can't be nullable: the unique (auction_id, prev_hash) index that
+  // prevents chain-forking needs a real, comparable value to catch two concurrent first bids.
+  declare prevHash: string;
   declare hash: string;
   declare readonly createdAt: CreationOptional<Date>;
 }
@@ -31,7 +34,7 @@ AuctionBidAudit.init(
     accepted: { type: DataTypes.BOOLEAN, allowNull: false },
     rejectReason: { type: DataTypes.STRING, allowNull: true },
     ipHash: { type: DataTypes.STRING, allowNull: true },
-    prevHash: { type: DataTypes.STRING, allowNull: true },
+    prevHash: { type: DataTypes.STRING, allowNull: false, defaultValue: '' },
     hash: { type: DataTypes.STRING, allowNull: false },
     createdAt: DataTypes.DATE,
   },

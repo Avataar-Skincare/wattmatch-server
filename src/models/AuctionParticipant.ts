@@ -9,6 +9,11 @@ export type AuctionParticipantRole = 'generator' | 'buyer';
 export class AuctionParticipant extends Model<InferAttributes<AuctionParticipant>, InferCreationAttributes<AuctionParticipant>> {
   declare id: CreationOptional<number>;
   declare auctionId: number;
+  // Encrypted at rest via fieldEncryption.ts (see LIVE_AUCTION_IDENTITY_ENCRYPTION_PLAN.md) — never
+  // the plaintext organization name. Callers must encryptField() before create()/update() and
+  // decryptField() after any read that legitimately needs the real name; nothing in this file does
+  // either automatically, so a plaintext value can't accidentally slip in through a code path that
+  // forgot to encrypt it.
   declare organizationName: string;
   declare alias: string;
   // 'buyer' is a read-only spectator seat — same alias-only exposure and join-token mechanism as a
@@ -29,7 +34,7 @@ AuctionParticipant.init(
   {
     id: { type: DataTypes.INTEGER.UNSIGNED, autoIncrement: true, primaryKey: true },
     auctionId: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false },
-    organizationName: { type: DataTypes.STRING, allowNull: false },
+    organizationName: { type: DataTypes.TEXT, allowNull: false },
     alias: { type: DataTypes.STRING, allowNull: false },
     role: { type: DataTypes.ENUM('generator', 'buyer'), allowNull: false, defaultValue: 'generator' },
     joinTokenId: { type: DataTypes.STRING, allowNull: false, unique: true },
