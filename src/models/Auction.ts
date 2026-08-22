@@ -35,6 +35,11 @@ export class Auction extends Model<InferAttributes<Auction>, InferCreationAttrib
   // package. Not a real PKI signature — see AUCTION_MVP_PLAN.md for what's deferred.
   declare resultSummaryJson: string | null;
   declare resultHash: string | null;
+  // Populated only when this auction was created via the vetting->auction bridge
+  // (VETTING_TO_AUCTION_BRIDGE_PLAN.md) — null for every manually-seeded auction, including all
+  // of today's demo auctions. Used for traceability and to guard against promoting the same
+  // tender to a live auction twice.
+  declare tenderRef: CreationOptional<number | null>;
   declare readonly createdAt: CreationOptional<Date>;
   declare readonly updatedAt: CreationOptional<Date>;
 }
@@ -56,6 +61,7 @@ Auction.init(
     winnerParticipantId: { type: DataTypes.INTEGER.UNSIGNED, allowNull: true },
     resultSummaryJson: { type: DataTypes.TEXT, allowNull: true },
     resultHash: { type: DataTypes.STRING, allowNull: true },
+    tenderRef: { type: DataTypes.INTEGER.UNSIGNED, allowNull: true },
     createdAt: DataTypes.DATE,
     updatedAt: DataTypes.DATE,
   },

@@ -7,6 +7,7 @@ import { redis } from '../lib/redis.js';
 import { AuctionParticipant, type AuctionParticipantRole } from '../models/AuctionParticipant.js';
 import { Auction } from '../models/Auction.js';
 import { logger } from '../lib/logger.js';
+import { processAuctionCloseEmdOutcomes } from '../services/emdOutcomeService.js';
 import {
   getAuctionState,
   submitBid,
@@ -400,6 +401,18 @@ function startCloseCheckLoop(io: SocketIOServer) {
             { where: { id: auction.id } }
           );
           await buildAndStoreResultSummary(auction.id, state.leaderParticipantId, state.leaderAlias, state.currentBid);
+          // EMD outcome matrix (TENDER_WORKFLOW_STAKEHOLDER_PLAN.md Stage 8) — refunds every
+          // approved-but-non-winning generator for this tender the moment the auction closes; the
+          // winner's EMD stays 'pending' until its success-charge outcome is settled separately.
+          // Deliberately isolated in its own try/catch: a bug here must never prevent the auction
+          // itself from closing or emitting its result — that's this file's actual job.
+          if (auction.tenderRef !== null) {
+            try {
+              await processAuctionCloseEmdOutcomes(String(auction.tenderRef), state.leaderAlias);
+            } catch (err) {
+              logger.error({ auctionId: auction.id, err }, '[EMD] failed to process auction-close outcomes');
+            }
+          }
           io.to(`auction:${auction.id}`).emit('auction:closed', {
             winnerAlias: state.leaderAlias,
             winningBid: state.currentBid,

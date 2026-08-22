@@ -1,0 +1,570 @@
+import { Router } from 'express';
+import rateLimit from 'express-rate-limit';
+import { Op } from 'sequelize';
+import { z } from 'zod';
+import crypto from 'node:crypto';
+import { Tender } from '../models/Tender.js';
+import { Organization } from '../models/Organization.js';
+import { TenderInvitation } from '../models/TenderInvitation.js';
+import { VettingBid } from '../models/VettingBid.js';
+import { Payment } from '../models/Payment.js';
+import { verifyOrgToken, signOrgToken, type OrgTokenPayload } from '../lib/orgAuth.js';
+import { hashPassword } from '../lib/passwordAuth.js';
+import { sendTenderInvitationEmail, sendGeneratedCredentialsEmail } from '../services/email.js';
+import { refundEmd, forfeitEmd } from '../services/emdOutcomeService.js';
+import { hasRfsDocumentPaid } from '../services/rfsDocumentAccessService.js';
+import { seedDefaultDocumentFields } from '../services/defaultTenderDocumentFields.js';
+import { logger } from '../lib/logger.js';
+
+const router = Router();
+
+const postLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
+const readLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
+const inviteLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
+
+const postTenderBodySchema = z.object({
+  title: z.string().trim().min(1, 'title is required').max(255),
+  requiredCapacityMw: z.number().positive('requiredCapacityMw must be a positive number'),
+  // Full requirement detail — deliberately separate from the teaser (title + capacity) any matched
+  // generator sees before being invited. See Tender.requirementsDetail's comment.
+  requirementsDetail: z.string().trim().max(20000).optional(),
+});
+
+const respondBodySchema = z.object({
+  accept: z.boolean(),
+});
+
+const publicListQuerySchema = z.object({
+  view: z.enum(['live', 'archived', 'completed']).optional(),
+});
+
+const enrollBodySchema = z.object({
+  email: z.string().trim().toLowerCase().email(),
+  // Best-effort fallback only — the Stage 3 form always collects Mobile as a required structured
+  // field now (Payment.payerMobile), so this only matters for rows created before that column
+  // existed, or the rare case that lookup somehow comes back empty.
+  contactPhone: z.string().trim().min(1).max(255).optional(),
+});
+
+function extractBearerToken(authHeader: string | undefined): string | undefined {
+  return authHeader?.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : undefined;
+}
+
+async function requireOrgAuth(authHeader: string | undefined): Promise<OrgTokenPayload | null> {
+  const token = extractBearerToken(authHeader);
+  if (!token) return null;
+  try {
+    return await verifyOrgToken(token);
+  } catch {
+    return null;
+  }
+}
+
+function frontendUrl(path: string): string {
+  const origin = process.env.CORS_ORIGIN ?? 'http://localhost:5173';
+  return `${origin}${path}`;
+}
+
+// Automated matching + invitation (TENDER_WORKFLOW_STAKEHOLDER_PLAN.md Stage 4b) — deliberately NOT
+// buyer-curated. The buyer never sees or selects individual candidates; every generator whose
+// self-declared capacity covers the tender's requirement is invited automatically, the moment the
+// tender is created. Known scope gap, not an oversight: this only matches against generators
+// already registered at creation time — a generator registering afterward isn't retroactively
+// matched. Closing that gap needs a background job (re-run matching on new registration or on a
+// schedule) which is out of scope for this pass — see the tech-stack plan's "background job queue"
+// note.
+async function autoInviteEligibleGenerators(tender: Tender): Promise<number[]> {
+  const generators = await Organization.findAll({
+    where: { type: 'generator', capacityMw: { [Op.gte]: tender.requiredCapacityMw } },
+  });
+
+  const invited: number[] = [];
+  for (const gen of generators) {
+    const [, created] = await TenderInvitation.findOrCreate({
+      where: { tenderId: tender.id, organizationId: gen.id },
+      defaults: { tenderId: tender.id, organizationId: gen.id, status: 'invited' },
+    });
+    if (created) {
+      invited.push(gen.id);
+      await sendTenderInvitationEmail(gen.contactEmail, tender.title, frontendUrl('/generator-portal'));
+    }
+  }
+  return invited;
+}
+
+// Buyer posts a tender requirement — see MINIMAL_PIPELINE_INTEGRATION_PLAN.md. Deliberately no
+// draft/review/publish workflow states — just enough to have a real tender id for the rest of the
+// pipeline (matching, invitations, vetting submissions, the auction bridge) to reference.
+router.post('/tenders', postLimiter, async (req, res, next) => {
+  try {
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+    if (payload.type !== 'buyer') {
+      return res.status(403).json({ success: false, error: 'Only buyer organizations can post a tender' });
+    }
+
+    const parsed = postTenderBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
+    }
+
+    const org = await Organization.findByPk(payload.organizationId);
+    if (!org) return res.status(401).json({ success: false, error: 'Unknown organization' });
+
+    const tender = await Tender.create({
+      buyerOrgId: org.id,
+      title: parsed.data.title,
+      requiredCapacityMw: String(parsed.data.requiredCapacityMw),
+      requirementsDetail: parsed.data.requirementsDetail ?? null,
+    });
+
+    // Stage 6.3's default document checklist — the buyer can add/delete fields afterward via
+    // tenderDocuments.ts, but every tender starts from the plan's own default list rather than an
+    // empty registry.
+    await seedDefaultDocumentFields(tender.id);
+
+    const invitedOrganizationIds = await autoInviteEligibleGenerators(tender);
+
+    logger.info(
+      { reqId: req.requestId, tenderId: tender.id, buyerOrgId: org.id, autoInvitedCount: invitedOrganizationIds.length },
+      '[TENDER] posted'
+    );
+
+    res.json({ success: true, tenderId: tender.id, autoInvitedOrganizationIds: invitedOrganizationIds });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Public tender listing (Stage 2) — no account needed, teaser fields only (never
+// requirementsDetail or buyer identity). "archived" has no backing concept yet (no tender is ever
+// marked archived today) and will simply return empty — flagged here rather than silently invented.
+router.get('/tenders', readLimiter, async (req, res, next) => {
+  try {
+    const parsed = publicListQuerySchema.safeParse(req.query);
+    if (!parsed.success) return res.status(400).json({ success: false, error: 'Invalid view parameter' });
+
+    const view = parsed.data.view;
+    let statusFilter: string[] | undefined;
+    if (view === 'live') statusFilter = ['open', 'vetting', 'live'];
+    else if (view === 'completed') statusFilter = ['closed'];
+    else if (view === 'archived') statusFilter = []; // no archiving concept exists yet — see comment above
+
+    const tenders = await Tender.findAll({
+      where: statusFilter ? { status: statusFilter } : {},
+      order: [['id', 'DESC']],
+    });
+
+    res.json({
+      success: true,
+      tenders: tenders.map((t) => ({
+        id: t.id,
+        title: t.title,
+        requiredCapacityMw: t.requiredCapacityMw,
+        status: t.status,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Generator's own profile view (Stage 5) — two tables in one response: tenders actually enrolled in
+// (accepted invitation), and ALL tenders with capacity-matches surfaced at the top (not filtered to
+// matches only, per the plan's explicit correction).
+router.get('/tenders/mine', readLimiter, async (req, res, next) => {
+  try {
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+    if (payload.type !== 'generator') {
+      return res.status(403).json({ success: false, error: 'Only generator organizations have this view' });
+    }
+
+    const org = await Organization.findByPk(payload.organizationId);
+    if (!org) return res.status(401).json({ success: false, error: 'Unknown organization' });
+
+    const invitations = await TenderInvitation.findAll({ where: { organizationId: org.id } });
+    const invitationByTenderId = new Map(invitations.map((i) => [i.tenderId, i]));
+
+    const allTenders = await Tender.findAll({ order: [['id', 'DESC']] });
+
+    const enrolled = allTenders
+      .filter((t) => invitationByTenderId.get(t.id)?.status === 'accepted')
+      .map((t) => ({
+        id: t.id,
+        title: t.title,
+        requiredCapacityMw: t.requiredCapacityMw,
+        status: t.status,
+        stage: invitationByTenderId.get(t.id)!.emdOutcome !== 'pending' ? 'settled' : t.status,
+      }));
+
+    const matchesCapacity = (t: Tender) => org.capacityMw !== null && Number(org.capacityMw) >= Number(t.requiredCapacityMw);
+    const listed = [...allTenders]
+      .sort((a, b) => Number(matchesCapacity(b)) - Number(matchesCapacity(a)))
+      .map((t) => ({
+        id: t.id,
+        title: t.title,
+        requiredCapacityMw: t.requiredCapacityMw,
+        status: t.status,
+        matchesCapacity: matchesCapacity(t),
+        invitationStatus: invitationByTenderId.get(t.id)?.status ?? null,
+      }));
+
+    res.json({ success: true, enrolled, listed });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Stage 4's account-less-purchaser bridge: "a person who has already bought the RfS Document can
+// revisit the tender and tap Enroll... an account is compulsory — on creation, login credentials
+// are emailed automatically." This is specifically for someone who paid in Stage 3 but never
+// separately registered — an already-registered generator uses the authenticated /self-enroll
+// route below instead. Public (no Bearer token) since the whole point is there's no account yet.
+router.post('/tenders/:id/enroll', inviteLimiter, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
+
+    const parsed = enrollBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
+    }
+    const { email } = parsed.data;
+
+    const tender = await Tender.findByPk(id);
+    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
+
+    if (!(await hasRfsDocumentPaid(id, email))) {
+      return res.status(402).json({ success: false, error: 'The RfS Document fee must be paid before enrolling in this tender' });
+    }
+
+    const existingOrg = await Organization.findOne({ where: { contactEmail: email } });
+    if (existingOrg) {
+      // Never silently attach this enrollment to an existing account — we have no way to verify
+      // this caller is actually that account's owner. Direct them to the authenticated path instead.
+      return res.status(409).json({
+        success: false,
+        error: 'An account already exists for this email — log in and enroll from your dashboard',
+        accountExists: true,
+      });
+    }
+
+    const rfsPayment = await Payment.findOne({
+      where: { tenderId: id, payerEmail: email, purpose: 'rfs_document', status: 'paid' },
+      order: [['id', 'DESC']],
+    });
+    const contactPhone = rfsPayment?.payerMobile || parsed.data.contactPhone;
+    if (!contactPhone) {
+      return res.status(400).json({ success: false, error: 'contactPhone is required to create your account' });
+    }
+
+    const generatedPassword = crypto.randomBytes(12).toString('base64url');
+    const passwordHash = await hashPassword(generatedPassword);
+
+    const org = await Organization.create({
+      type: 'generator',
+      name: rfsPayment?.payerName || email,
+      contactEmail: email,
+      contactPhone,
+      passwordHash,
+    });
+
+    await sendGeneratedCredentialsEmail(email, generatedPassword, frontendUrl('/login'));
+
+    await TenderInvitation.findOrCreate({
+      where: { tenderId: id, organizationId: org.id },
+      defaults: { tenderId: id, organizationId: org.id, status: 'accepted', respondedAt: new Date() },
+    });
+
+    const token = await signOrgToken({ organizationId: org.id, type: org.type });
+
+    logger.info({ reqId: req.requestId, tenderId: id, organizationId: org.id }, '[TENDER] account auto-created and enrolled');
+
+    res.json({ success: true, status: 'accepted', organizationId: org.id, token, accountCreated: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Open self-enroll (Stage 4a) — a generator can enroll directly with no buyer/admin involvement.
+// Gated on having already bought the tender's RfS Document (Stage 3) — this applies to
+// self-enrolled generators exactly the same as auto-invited ones (invitation only means "come
+// consider this tender," it never exempts anyone from the fee). See rfsDocumentAccessService.ts.
+router.post('/tenders/:id/self-enroll', inviteLimiter, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
+
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+    if (payload.type !== 'generator') {
+      return res.status(403).json({ success: false, error: 'Only generator organizations can self-enroll' });
+    }
+
+    const tender = await Tender.findByPk(id);
+    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
+
+    const org = await Organization.findByPk(payload.organizationId);
+    if (!org) return res.status(401).json({ success: false, error: 'Unknown organization' });
+
+    if (!(await hasRfsDocumentPaid(id, org.contactEmail))) {
+      return res.status(402).json({
+        success: false,
+        error: "The RfS Document fee must be paid before enrolling in this tender",
+      });
+    }
+
+    const [invitation, created] = await TenderInvitation.findOrCreate({
+      where: { tenderId: id, organizationId: payload.organizationId },
+      defaults: { tenderId: id, organizationId: payload.organizationId, status: 'accepted', respondedAt: new Date() },
+    });
+    if (!created && invitation.status !== 'accepted') {
+      await invitation.update({ status: 'accepted', respondedAt: new Date() });
+    }
+
+    logger.info({ reqId: req.requestId, tenderId: id, organizationId: payload.organizationId }, '[TENDER] self-enrolled');
+
+    res.json({ success: true, status: 'accepted' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Matching engine — real, if simple: a generator matches if its self-declared capacity covers the
+// full requirement. Read-only buyer visibility now — invitations are sent automatically at tender
+// creation (see autoInviteEligibleGenerators above), the buyer does not curate/select who gets
+// invited (TENDER_WORKFLOW_STAKEHOLDER_PLAN.md Stage 4b). This endpoint just shows what the
+// automation already did. See MINIMAL_PIPELINE_INTEGRATION_PLAN.md for why deeper eligibility rules
+// (state regulatory compatibility, timeline fit) are a separate, larger, already-estimated build.
+router.get('/tenders/:id/matches', readLimiter, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
+
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+
+    const tender = await Tender.findByPk(id);
+    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
+    if (payload.type !== 'buyer' || payload.organizationId !== tender.buyerOrgId) {
+      return res.status(403).json({ success: false, error: 'Only the owning buyer can view matches for this tender' });
+    }
+
+    const generators = await Organization.findAll({
+      where: { type: 'generator', capacityMw: { [Op.gte]: tender.requiredCapacityMw } },
+    });
+
+    const invitations = await TenderInvitation.findAll({ where: { tenderId: id } });
+    const invitedIds = new Set(invitations.map((i) => i.organizationId));
+
+    res.json({
+      success: true,
+      tenderId: id,
+      matches: generators.map((g) => ({
+        organizationId: g.id,
+        name: g.name,
+        capacityMw: g.capacityMw,
+        alreadyInvited: invitedIds.has(g.id),
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Full tender detail — gated. The owning buyer always sees it; a generator sees it only once an
+// invitation row exists for them (any status — a declined generator can still see what they
+// declined). Everyone else gets a 403, not a 404, so a generator can tell "not invited" apart from
+// "doesn't exist" — deliberately, since that distinction is useful and this isn't a secrecy-critical
+// boundary the way the sealed-bid content is.
+router.get('/tenders/:id', readLimiter, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
+
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+
+    const tender = await Tender.findByPk(id);
+    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
+
+    let invitationStatus: string | null = null;
+    // Buyer identity — deliberately a separate, stricter gate from requirementsDetail. A generator
+    // gets enough to prepare and submit a bid (capacity, tech mix, location) once it has paid the
+    // RfS Document fee, but never learns WHO the buyer is until it has both paid that fee and
+    // actually submitted a bid. This is intentional: it stops a generator from learning the buyer's
+    // identity and going around the platform before it has committed anything. Both gates are keyed
+    // on the SAME payment check (rfsDocumentAccessService.ts) — applies uniformly whether the
+    // generator arrived via auto-invitation or open self-enroll; being invited only means "come
+    // consider this tender," it never exempts anyone from the fee.
+    let requirementsDetail: string | null = null;
+    let buyer: { name: string; contactEmail: string; contactPhone: string } | null = null;
+    let buyerLockedReason: string | null = null;
+
+    if (payload.type === 'buyer') {
+      if (payload.organizationId !== tender.buyerOrgId) {
+        return res.status(403).json({ success: false, error: 'Not authorized to view this tender' });
+      }
+      requirementsDetail = tender.requirementsDetail;
+      const ownBuyer = await Organization.findByPk(tender.buyerOrgId);
+      if (ownBuyer) buyer = { name: ownBuyer.name, contactEmail: ownBuyer.contactEmail, contactPhone: ownBuyer.contactPhone };
+    } else {
+      const invitation = await TenderInvitation.findOne({ where: { tenderId: id, organizationId: payload.organizationId } });
+      if (!invitation) {
+        return res.status(403).json({ success: false, error: 'This tender is not visible until you are invited' });
+      }
+      invitationStatus = invitation.status;
+
+      const org = await Organization.findByPk(payload.organizationId);
+      if (!org) return res.status(401).json({ success: false, error: 'Unknown organization' });
+      const feesPaid = await hasRfsDocumentPaid(id, org.contactEmail);
+
+      if (feesPaid) requirementsDetail = tender.requirementsDetail;
+
+      const hasSubmittedBid = await VettingBid.findOne({
+        where: { tenderRef: String(id), generatorOrgId: payload.organizationId },
+      });
+
+      if (feesPaid && hasSubmittedBid) {
+        const buyerOrg = await Organization.findByPk(tender.buyerOrgId);
+        if (buyerOrg) buyer = { name: buyerOrg.name, contactEmail: buyerOrg.contactEmail, contactPhone: buyerOrg.contactPhone };
+      } else {
+        const missing: string[] = [];
+        if (!feesPaid) missing.push('RfS fee not yet paid');
+        if (!hasSubmittedBid) missing.push('bid not yet submitted');
+        buyerLockedReason = missing.join('; ');
+      }
+    }
+
+    res.json({
+      success: true,
+      tender: {
+        id: tender.id,
+        title: tender.title,
+        requiredCapacityMw: tender.requiredCapacityMw,
+        requirementsDetail,
+        status: tender.status,
+      },
+      invitationStatus,
+      buyer,
+      buyerLockedReason,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// A generator accepts or declines its invitation. Submission (vettingBids.ts) requires 'accepted'
+// specifically — 'invited' alone is not enough to submit a bid, only enough to view the tender.
+router.post('/tenders/:id/invitations/respond', readLimiter, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
+
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+    if (payload.type !== 'generator') {
+      return res.status(403).json({ success: false, error: 'Only generator organizations respond to invitations' });
+    }
+
+    const parsed = respondBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
+    }
+
+    const invitation = await TenderInvitation.findOne({ where: { tenderId: id, organizationId: payload.organizationId } });
+    if (!invitation) return res.status(404).json({ success: false, error: 'No invitation found for this tender' });
+
+    await invitation.update({ status: parsed.data.accept ? 'accepted' : 'declined', respondedAt: new Date() });
+
+    logger.info(
+      { reqId: req.requestId, tenderId: id, organizationId: payload.organizationId, status: invitation.status },
+      '[TENDER] invitation responded'
+    );
+
+    res.json({ success: true, status: invitation.status });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// TENDER_WORKFLOW_STAKEHOLDER_PLAN.md's Stage 8 matrix: the auction winner's EMD is left 'pending'
+// at close specifically so it can be settled here once the outcome is known. This now checks a
+// REAL Payment row (purpose 'success_charge', status 'paid') rather than trusting a client-supplied
+// boolean — the winner pays via the existing authenticated /payment/orders route (same as
+// bid_processing/emd), and this route just confirms that happened before refunding the EMD. It
+// deliberately does NOT forfeit on a missing payment — "hasn't paid yet" and "will never pay" are
+// different things, and only a human (the buyer, via declare-default below) can tell them apart.
+router.post('/tenders/:id/invitations/:organizationId/settle-winner', inviteLimiter, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const organizationId = Number(req.params.organizationId);
+    if (!Number.isFinite(id) || !Number.isFinite(organizationId)) {
+      return res.status(400).json({ success: false, error: 'Invalid tender or organization id' });
+    }
+
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+
+    const tender = await Tender.findByPk(id);
+    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
+    if (payload.type !== 'buyer' || payload.organizationId !== tender.buyerOrgId) {
+      return res.status(403).json({ success: false, error: 'Only the owning buyer can settle the auction winner for this tender' });
+    }
+
+    const successChargePayment = await Payment.findOne({
+      where: { tenderId: id, organizationId, purpose: 'success_charge', status: 'paid' },
+    });
+    if (!successChargePayment) {
+      return res.status(409).json({ success: false, error: 'The success charge has not been paid yet for this generator' });
+    }
+
+    await refundEmd(id, organizationId, 'Won the auction and paid success charges');
+
+    logger.info({ reqId: req.requestId, tenderId: id, organizationId }, '[TENDER] auction winner settled — success charge confirmed paid, EMD refunded');
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// The other branch of Stage 8's matrix: the buyer's own explicit call that the winner backed out
+// or failed to pay the success charge — a separate, deliberate action rather than inferring intent
+// from a missing payment (see settle-winner's comment above for why that distinction matters).
+router.post('/tenders/:id/invitations/:organizationId/declare-default', inviteLimiter, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const organizationId = Number(req.params.organizationId);
+    if (!Number.isFinite(id) || !Number.isFinite(organizationId)) {
+      return res.status(400).json({ success: false, error: 'Invalid tender or organization id' });
+    }
+
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+
+    const tender = await Tender.findByPk(id);
+    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
+    if (payload.type !== 'buyer' || payload.organizationId !== tender.buyerOrgId) {
+      return res.status(403).json({ success: false, error: 'Only the owning buyer can declare a default for this tender' });
+    }
+
+    const successChargePayment = await Payment.findOne({
+      where: { tenderId: id, organizationId, purpose: 'success_charge', status: 'paid' },
+    });
+    if (successChargePayment) {
+      return res.status(409).json({ success: false, error: 'The success charge has already been paid — use settle-winner instead' });
+    }
+
+    await forfeitEmd(id, organizationId, 'Won the auction, then backed out of success charges');
+
+    logger.info({ reqId: req.requestId, tenderId: id, organizationId }, '[TENDER] auction winner declared default — EMD forfeited');
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+export default router;

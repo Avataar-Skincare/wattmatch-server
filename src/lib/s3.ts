@@ -1,0 +1,79 @@
+import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { logger } from './logger.js';
+
+// Mirrors lib/secrets.ts's philosophy exactly: local dev needs zero AWS setup. AWS_S3_BUCKET unset
+// means every call below transparently reads/writes a local directory instead; setting it (always
+// true in production) switches every call to real S3 with no other code change — see
+// TENDER_WORKFLOW_STAKEHOLDER_PLAN.md's Tech Stack section ("File storage — AWS S3, net-new...
+// private bucket, server-side encrypted, accessed only via short-lived signed URLs").
+const LOCAL_STORAGE_DIR = process.env.LOCAL_STORAGE_DIR || './local-storage';
+
+let client: S3Client | null = null;
+function getClient(): S3Client {
+  if (!client) client = new S3Client({});
+  return client;
+}
+
+function bucketName(): string | undefined {
+  return process.env.AWS_S3_BUCKET;
+}
+
+export async function uploadObject(key: string, body: Buffer, contentType: string): Promise<void> {
+  const bucket = bucketName();
+  if (!bucket) {
+    const filePath = path.join(LOCAL_STORAGE_DIR, key);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, body);
+    logger.info({ key, filePath }, '[S3] AWS_S3_BUCKET not set — wrote to local storage fallback');
+    return;
+  }
+  await getClient().send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: body,
+      ContentType: contentType,
+      // SSE-KMS per the plan's storage spec — relies on the bucket's default KMS key unless a
+      // specific one is configured via AWS_S3_KMS_KEY_ID.
+      ServerSideEncryption: 'aws:kms',
+      ...(process.env.AWS_S3_KMS_KEY_ID ? { SSEKMSKeyId: process.env.AWS_S3_KMS_KEY_ID } : {}),
+    })
+  );
+}
+
+export async function readObject(key: string): Promise<Buffer | null> {
+  const bucket = bucketName();
+  if (!bucket) {
+    try {
+      return await fs.readFile(path.join(LOCAL_STORAGE_DIR, key));
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const result = await getClient().send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    const bytes = await result.Body?.transformToByteArray();
+    return bytes ? Buffer.from(bytes) : null;
+  } catch {
+    return null;
+  }
+}
+
+// Local-storage fallback has no real signing/expiry — it's a dev-only stand-in served by
+// routes/devLocalStorage.ts, which itself refuses to serve anything once AWS_S3_BUCKET is set, so
+// this path is never reachable in production.
+export async function getSignedDownloadUrl(key: string, expiresInSeconds = 300): Promise<string> {
+  const bucket = bucketName();
+  if (!bucket) {
+    const base = process.env.PUBLIC_API_URL || 'http://localhost:4000';
+    return `${base}/api/dev/local-storage/${key}`;
+  }
+  return getSignedUrl(getClient(), new GetObjectCommand({ Bucket: bucket, Key: key }), { expiresIn: expiresInSeconds });
+}
+
+export function isLocalStorageFallbackActive(): boolean {
+  return !bucketName();
+}
