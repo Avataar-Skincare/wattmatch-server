@@ -6,6 +6,7 @@ import { Tender } from '../models/Tender.js';
 import { TenderInvitation } from '../models/TenderInvitation.js';
 import { TenderDocumentField, type DocumentEnvelope } from '../models/TenderDocumentField.js';
 import { TenderDocumentUpload } from '../models/TenderDocumentUpload.js';
+import { VettingOpeningAttestation } from '../models/VettingOpeningAttestation.js';
 import { verifyOrgToken, type OrgTokenPayload } from '../lib/orgAuth.js';
 import { uploadObject, getSignedDownloadUrl } from '../lib/s3.js';
 import { logger } from '../lib/logger.js';
@@ -71,10 +72,11 @@ function s3KeyForUpload(tenderId: number, fieldId: number, organizationId: numbe
   return `tender-documents/${tenderId}/uploads/${fieldId}-org${organizationId}-${Date.now()}-${filename}`;
 }
 
-// Same visibility boundary as GET /tenders/:id in tenders.ts: the owning buyer, or a generator
-// holding ANY invitation row (any status) — the checklist itself isn't the sensitive content here
-// (the uploaded documents are, separately gated below), so it's fine for an invited generator to
-// see what they'll eventually need before formally accepting.
+// Admin manages every tender's document checklist (buyers have no operational role here at all —
+// they register and submit a tender request, WattMatch's own team runs everything from there), or
+// a generator holding ANY invitation row (any status) — the checklist itself isn't the sensitive
+// content here (the uploaded documents are, separately gated below), so it's fine for an invited
+// generator to see what they'll eventually need before formally accepting.
 async function requireTenderVisibility(
   tenderId: number,
   payload: OrgTokenPayload
@@ -82,12 +84,7 @@ async function requireTenderVisibility(
   const tender = await Tender.findByPk(tenderId);
   if (!tender) return { ok: false, status: 404, error: 'Tender not found' };
 
-  if (payload.type === 'buyer') {
-    if (payload.organizationId !== tender.buyerOrgId) {
-      return { ok: false, status: 403, error: 'Not authorized to view this tender' };
-    }
-    return { ok: true };
-  }
+  if (payload.type === 'admin') return { ok: true };
 
   const invitation = await TenderInvitation.findOne({ where: { tenderId, organizationId: payload.organizationId } });
   if (!invitation) return { ok: false, status: 403, error: 'This tender is not visible until you are invited' };
@@ -128,8 +125,9 @@ router.get('/tenders/:id/document-fields', readLimiter, async (req, res, next) =
   }
 });
 
-// Buyer-only: add a custom field on top of the default checklist (Stage 6.3). Always multipart so
-// an optional blank-template PDF can ride along with the same request as the text fields.
+// Admin-only: add a custom field on top of the default checklist (Stage 6.3) — buyers have no
+// operational role in running a tender once they've requested it. Always multipart so an optional
+// blank-template PDF can ride along with the same request as the text fields.
 router.post('/tenders/:id/document-fields', writeLimiter, upload.single('template'), async (req, res, next) => {
   try {
     const tenderId = Number(req.params.id);
@@ -140,8 +138,8 @@ router.post('/tenders/:id/document-fields', writeLimiter, upload.single('templat
 
     const tender = await Tender.findByPk(tenderId);
     if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
-    if (payload.type !== 'buyer' || payload.organizationId !== tender.buyerOrgId) {
-      return res.status(403).json({ success: false, error: 'Only the owning buyer can configure this tender\'s document fields' });
+    if (payload.type !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Only admin organizations can configure this tender\'s document fields' });
     }
 
     const parsed = addFieldBodySchema.safeParse(req.body);
@@ -183,7 +181,7 @@ router.post('/tenders/:id/document-fields', writeLimiter, upload.single('templat
   }
 });
 
-// Buyer-only: remove a field (Stage 6.3). Cascades to any uploads already made against it — once
+// Admin-only: remove a field (Stage 6.3). Cascades to any uploads already made against it — once
 // the requirement is gone, keeping orphaned files around serves no one.
 router.delete('/tenders/:id/document-fields/:fieldId', writeLimiter, async (req, res, next) => {
   try {
@@ -198,8 +196,8 @@ router.delete('/tenders/:id/document-fields/:fieldId', writeLimiter, async (req,
 
     const tender = await Tender.findByPk(tenderId);
     if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
-    if (payload.type !== 'buyer' || payload.organizationId !== tender.buyerOrgId) {
-      return res.status(403).json({ success: false, error: 'Only the owning buyer can configure this tender\'s document fields' });
+    if (payload.type !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Only admin organizations can configure this tender\'s document fields' });
     }
 
     const field = await TenderDocumentField.findOne({ where: { id: fieldId, tenderId } });
@@ -314,8 +312,11 @@ router.get('/tenders/:id/documents/mine', readLimiter, async (req, res, next) =>
   }
 });
 
-// Buyer-only: review a specific generator's uploaded documents — the admin/vetting-side half of
-// this feature.
+// Admin-only: review a specific generator's uploaded documents. Gated on the technical envelope's
+// opening ceremony having actually run — these checklist documents (financial statements,
+// eligibility docs, board resolutions, etc.) are themselves part of what gets evaluated as the
+// technical bid, so they carry the same "not even admin can see it early" guarantee the sealed-bid
+// ciphertext already gets, not just an ordinary access-control check.
 router.get('/tenders/:id/documents/:organizationId', readLimiter, async (req, res, next) => {
   try {
     const tenderId = Number(req.params.id);
@@ -329,8 +330,18 @@ router.get('/tenders/:id/documents/:organizationId', readLimiter, async (req, re
 
     const tender = await Tender.findByPk(tenderId);
     if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
-    if (payload.type !== 'buyer' || payload.organizationId !== tender.buyerOrgId) {
-      return res.status(403).json({ success: false, error: 'Only the owning buyer can review this tender\'s documents' });
+    if (payload.type !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Only admin organizations can review this tender\'s documents' });
+    }
+
+    const technicalOpening = await VettingOpeningAttestation.findOne({
+      where: { tenderRef: String(tenderId), envelope: 'technical' },
+    });
+    if (!technicalOpening) {
+      return res.status(409).json({
+        success: false,
+        error: 'Documents are not visible until the technical envelope\'s opening ceremony has run for this tender',
+      });
     }
 
     const documents = await buildDocumentStatus(tenderId, organizationId);

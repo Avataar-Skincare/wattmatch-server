@@ -5,6 +5,7 @@ import { Tender } from '../models/Tender.js';
 import { TenderInvitation } from '../models/TenderInvitation.js';
 import { TenderDocumentField } from '../models/TenderDocumentField.js';
 import { TenderDocumentUpload } from '../models/TenderDocumentUpload.js';
+import { VettingOpeningAttestation } from '../models/VettingOpeningAttestation.js';
 import { signOrgToken } from '../lib/orgAuth.js';
 
 let app: express.Express;
@@ -12,6 +13,7 @@ let server: ReturnType<express.Express['listen']>;
 let baseUrl: string;
 let buyerOrgId: number;
 let buyerToken: string;
+let adminToken: string;
 let generatorOrgId: number;
 let generatorToken: string;
 let tenderId: number;
@@ -47,6 +49,10 @@ beforeAll(async () => {
   buyerToken = await signOrgToken({ organizationId: buyer.id, type: 'buyer' });
   createdOrgIds.push(buyer.id);
 
+  const admin = await Organization.create({ type: 'admin', name: 'Docs Test Admin', contactEmail: `docs-admin-${Date.now()}@test.local`, contactPhone: '9000000004' });
+  adminToken = await signOrgToken({ organizationId: admin.id, type: 'admin' });
+  createdOrgIds.push(admin.id);
+
   const generator = await Organization.create({ type: 'generator', name: 'Docs Test Generator', contactEmail: `docs-gen-${Date.now()}@test.local`, contactPhone: '9000000001' });
   generatorOrgId = generator.id;
   generatorToken = await signOrgToken({ organizationId: generator.id, type: 'generator' });
@@ -58,6 +64,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  await VettingOpeningAttestation.destroy({ where: { tenderRef: String(tenderId) } });
   await TenderDocumentUpload.destroy({ where: { tenderId } });
   await TenderDocumentField.destroy({ where: { tenderId } });
   await TenderInvitation.destroy({ where: { tenderId } });
@@ -89,11 +96,11 @@ async function get(path: string, token?: string) {
 }
 
 describe('tenderDocuments routes', () => {
-  it('a buyer can add a custom field, and it appears in the registry', async () => {
-    const res = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: 'technical', key: 'custom_field', label: 'Custom Field' }, null, buyerToken);
+  it('an admin can add a custom field, and it appears in the registry', async () => {
+    const res = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: 'technical', key: 'custom_field', label: 'Custom Field' }, null, adminToken);
     expect(res.status).toBe(200);
 
-    const list = await get(`/api/tenders/${tenderId}/document-fields`, buyerToken);
+    const list = await get(`/api/tenders/${tenderId}/document-fields`, adminToken);
     expect(list.status).toBe(200);
     const field = list.body.fields.find((f: { key: string }) => f.key === 'custom_field');
     expect(field).toBeTruthy();
@@ -102,16 +109,12 @@ describe('tenderDocuments routes', () => {
   });
 
   it('rejects a duplicate field key for the same tender', async () => {
-    const res = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: 'technical', key: 'custom_field', label: 'Custom Field Again' }, null, buyerToken);
+    const res = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: 'technical', key: 'custom_field', label: 'Custom Field Again' }, null, adminToken);
     expect(res.status).toBe(409);
   });
 
-  it('only the owning buyer can add or delete fields', async () => {
-    const otherBuyer = await Organization.create({ type: 'buyer', name: 'Other Buyer', contactEmail: `other-buyer-${Date.now()}@test.local`, contactPhone: '9000000002' });
-    createdOrgIds.push(otherBuyer.id);
-    const otherToken = await signOrgToken({ organizationId: otherBuyer.id, type: 'buyer' });
-
-    const addRes = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: 'technical', key: 'sneaky_field', label: 'Sneaky' }, null, otherToken);
+  it('only admin organizations can add or delete fields — the owning buyer has no operational role here', async () => {
+    const addRes = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: 'technical', key: 'sneaky_field', label: 'Sneaky' }, null, buyerToken);
     expect(addRes.status).toBe(403);
 
     const genRes = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: 'technical', key: 'sneaky_field_2', label: 'Sneaky 2' }, null, generatorToken);
@@ -123,11 +126,11 @@ describe('tenderDocuments routes', () => {
       `/api/tenders/${tenderId}/document-fields`,
       { envelope: 'financial', key: 'field_with_template', label: 'Field With Template' },
       { field: 'template', filename: 'template.pdf', content: pdfBuffer(), contentType: 'application/pdf' },
-      buyerToken
+      adminToken
     );
     expect(res.status).toBe(200);
 
-    const list = await get(`/api/tenders/${tenderId}/document-fields`, buyerToken);
+    const list = await get(`/api/tenders/${tenderId}/document-fields`, adminToken);
     const field = list.body.fields.find((f: { key: string }) => f.key === 'field_with_template');
     expect(field.hasTemplate).toBe(true);
     expect(typeof field.templateUrl).toBe('string');
@@ -142,13 +145,13 @@ describe('tenderDocuments routes', () => {
       `/api/tenders/${tenderId}/document-fields`,
       { envelope: 'technical', key: 'bad_field', label: 'Bad Field' },
       { field: 'template', filename: 'template.txt', content: Buffer.from('not a pdf'), contentType: 'text/plain' },
-      buyerToken
+      adminToken
     );
     expect(res.status).toBe(400);
   });
 
   it('a generator can upload a document for a field, and it shows up in their own status view', async () => {
-    const fieldRes = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: 'technical', key: 'upload_target', label: 'Upload Target' }, null, buyerToken);
+    const fieldRes = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: 'technical', key: 'upload_target', label: 'Upload Target' }, null, adminToken);
     expect(fieldRes.status).toBe(200);
     const fieldId = fieldRes.body.id;
 
@@ -169,7 +172,7 @@ describe('tenderDocuments routes', () => {
   });
 
   it('re-uploading the same field replaces the previous upload rather than creating a duplicate', async () => {
-    const fieldRes = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: 'technical', key: 'replace_target', label: 'Replace Target' }, null, buyerToken);
+    const fieldRes = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: 'technical', key: 'replace_target', label: 'Replace Target' }, null, adminToken);
     const fieldId = fieldRes.body.id;
 
     await postMultipart(`/api/tenders/${tenderId}/document-fields/${fieldId}/upload`, {}, { field: 'file', filename: 'v1.pdf', content: pdfBuffer(), contentType: 'application/pdf' }, generatorToken);
@@ -189,25 +192,47 @@ describe('tenderDocuments routes', () => {
     const pendingToken = await signOrgToken({ organizationId: pendingGen.id, type: 'generator' });
     await TenderInvitation.create({ tenderId, organizationId: pendingGen.id, status: 'invited' });
 
-    const fieldRes = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: 'technical', key: 'gated_field', label: 'Gated Field' }, null, buyerToken);
+    const fieldRes = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: 'technical', key: 'gated_field', label: 'Gated Field' }, null, adminToken);
     const fieldId = fieldRes.body.id;
 
     const res = await postMultipart(`/api/tenders/${tenderId}/document-fields/${fieldId}/upload`, {}, { field: 'file', filename: 'x.pdf', content: pdfBuffer(), contentType: 'application/pdf' }, pendingToken);
     expect(res.status).toBe(403);
   });
 
-  it('the buyer can review a specific generator\'s uploaded documents', async () => {
-    const review = await get(`/api/tenders/${tenderId}/documents/${generatorOrgId}`, buyerToken);
+  it('only admin organizations can review a generator\'s uploaded documents — the owning buyer has no visibility here', async () => {
+    const buyerReview = await get(`/api/tenders/${tenderId}/documents/${generatorOrgId}`, buyerToken);
+    expect(buyerReview.status).toBe(403);
+
+    const genReview = await get(`/api/tenders/${tenderId}/documents/${generatorOrgId}`, generatorToken);
+    expect(genReview.status).toBe(403);
+  });
+
+  it('rejects document review (409) before the technical envelope\'s opening ceremony has run for this tender', async () => {
+    const review = await get(`/api/tenders/${tenderId}/documents/${generatorOrgId}`, adminToken);
+    expect(review.status).toBe(409);
+  });
+
+  it('allows an admin to review a specific generator\'s uploaded documents once the technical ceremony has run', async () => {
+    await VettingOpeningAttestation.create({
+      tenderRef: String(tenderId),
+      envelope: 'technical',
+      openedSetHash: 'test-opened-set-hash',
+      shareFingerprint1: 'test-fingerprint-1',
+      shareFingerprint2: 'test-fingerprint-2',
+      emergencyJustification: null,
+    });
+
+    const review = await get(`/api/tenders/${tenderId}/documents/${generatorOrgId}`, adminToken);
     expect(review.status).toBe(200);
     expect(review.body.documents.some((d: { uploaded: boolean }) => d.uploaded)).toBe(true);
   });
 
   it('deleting a field also removes any uploads made against it', async () => {
-    const fieldRes = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: 'technical', key: 'doomed_field', label: 'Doomed Field' }, null, buyerToken);
+    const fieldRes = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: 'technical', key: 'doomed_field', label: 'Doomed Field' }, null, adminToken);
     const fieldId = fieldRes.body.id;
     await postMultipart(`/api/tenders/${tenderId}/document-fields/${fieldId}/upload`, {}, { field: 'file', filename: 'x.pdf', content: pdfBuffer(), contentType: 'application/pdf' }, generatorToken);
 
-    const delRes = await fetch(`${baseUrl}/api/tenders/${tenderId}/document-fields/${fieldId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${buyerToken}` } });
+    const delRes = await fetch(`${baseUrl}/api/tenders/${tenderId}/document-fields/${fieldId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${adminToken}` } });
     expect(delRes.status).toBe(200);
 
     const remainingField = await TenderDocumentField.findByPk(fieldId);

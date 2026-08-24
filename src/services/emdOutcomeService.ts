@@ -1,18 +1,46 @@
 import { TenderInvitation } from '../models/TenderInvitation.js';
 import { VettingBid } from '../models/VettingBid.js';
+import { Payment } from '../models/Payment.js';
+import { refundPayment } from './paymentRefundService.js';
 import { logger } from '../lib/logger.js';
 
-// EMD outcome tracking per TENDER_WORKFLOW_STAKEHOLDER_PLAN.md's Stage 8 matrix. No payment module
-// exists yet, so these functions only record the DECISION (pending/refunded/forfeited) on the
-// invitation row — they do not move real money. Once Razorpay/EMD payment lands, the actual
-// refund/capture call belongs right where refundEmd/forfeitEmd are invoked below, not as a separate
-// reconciliation step bolted on later.
+// EMD outcome tracking per TENDER_WORKFLOW_STAKEHOLDER_PLAN.md's Stage 8 matrix, recorded on the
+// invitation row. refundEmd now actually moves money (via the same refundPayment() the admin
+// refund route uses) — forfeitEmd never needs to call Razorpay at all: forfeiture just means "keep
+// the already-captured payment," which requires no further action.
 
-export async function refundEmd(tenderId: number, organizationId: number, reason: string): Promise<void> {
+// Idempotency note: the `emdOutcome !== 'pending'` guard correctly prevents a second call once the
+// first has recorded an outcome, covering every real call pattern in this codebase (auction close,
+// settle-winner, declare-default — none of which fire concurrently for the same invitation in
+// practice). It does not close a theoretical race between two near-simultaneous calls that both
+// read 'pending' before either writes — accepted as a low-probability, bounded residual risk rather
+// than adding a distributed lock for a scenario nothing here actually triggers.
+// Returns whether the EMD was actually refunded — callers that report their own outcome to a user
+// or a log line (e.g. tenders.ts's settle-winner) should reflect this rather than assuming success,
+// since a call that returns without throwing is not the same as money having actually moved.
+export async function refundEmd(tenderId: number, organizationId: number, reason: string): Promise<boolean> {
   const invitation = await TenderInvitation.findOne({ where: { tenderId, organizationId } });
-  if (!invitation || invitation.emdOutcome !== 'pending') return; // already settled, or never invited — don't overwrite a real outcome
+  if (!invitation) return false;
+  if (invitation.emdOutcome !== 'pending') return invitation.emdOutcome === 'refunded'; // already settled — report what it actually settled as, don't overwrite
+
+  const emdPayment = await Payment.findOne({ where: { tenderId, organizationId, purpose: 'emd', status: 'paid' } });
+  if (!emdPayment) {
+    // Should be unreachable — bid submission is gated on a paid EMD (vettingBids.ts) — but refusing
+    // to silently mark "refunded" when there is nothing to actually refund is the honest behavior:
+    // leave the outcome 'pending' so this is visible and investigable, not quietly wrong.
+    logger.error({ tenderId, organizationId, reason }, '[EMD] no paid EMD payment found to refund — outcome left pending for manual investigation');
+    return false;
+  }
+
+  const outcome = await refundPayment(emdPayment);
+  if (!outcome.ok) {
+    logger.error({ tenderId, organizationId, reason, refundReason: outcome.reason, message: outcome.message }, '[EMD] refund attempt failed — outcome left pending for manual investigation');
+    return false;
+  }
+
   await invitation.update({ emdOutcome: 'refunded', emdOutcomeAt: new Date(), emdOutcomeReason: reason });
-  logger.info({ tenderId, organizationId, reason }, '[EMD] refund recorded');
+  logger.info({ tenderId, organizationId, reason, refundId: outcome.refundId }, '[EMD] refund recorded');
+  return true;
 }
 
 export async function forfeitEmd(tenderId: number, organizationId: number, reason: string): Promise<void> {

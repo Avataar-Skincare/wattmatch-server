@@ -12,6 +12,8 @@ import { TenderInvitation } from '../models/TenderInvitation.js';
 import { Payment } from '../models/Payment.js';
 import { TenderDocumentField } from '../models/TenderDocumentField.js';
 import { TenderDocumentUpload } from '../models/TenderDocumentUpload.js';
+import { TenderRequest } from '../models/TenderRequest.js';
+import { signOrgToken } from '../lib/orgAuth.js';
 
 // Proves the full minimal pipeline actually connects end to end — see
 // MINIMAL_PIPELINE_INTEGRATION_PLAN.md and VETTING_TO_AUCTION_BRIDGE_PLAN.md. Real MySQL/Redis,
@@ -59,6 +61,7 @@ afterAll(async () => {
     await Payment.destroy({ where: { tenderId: id } });
     await TenderDocumentUpload.destroy({ where: { tenderId: id } });
     await TenderDocumentField.destroy({ where: { tenderId: id } });
+    await TenderRequest.destroy({ where: { tenderId: id } });
     await Tender.destroy({ where: { id } });
   }
   for (const id of createdOrgIds) await Organization.destroy({ where: { id } });
@@ -107,30 +110,65 @@ describe('full minimal pipeline: registration -> tender -> matching -> vetting -
     expect(generatorReg.status).toBe(200);
     createdOrgIds.push(generatorReg.body.organizationId);
 
-    // 2. Buyer posts a tender — matching + invitation is automatic at creation (no buyer
-    // curation step), so the already-registered, capacity-matching generator is auto-invited here.
+    // 2. Buyer submits a tender REQUEST (not a live tender directly) — an internal admin reviews
+    // it and creates the real, priced tender. Admin org created directly via the model since the
+    // public registration route deliberately doesn't allow self-registering as 'admin'.
+    const adminOrg = await Organization.create({
+      type: 'admin',
+      name: 'Test Admin',
+      contactEmail: `admin-${Date.now()}@test.local`,
+      contactPhone: '7000000000',
+    });
+    createdOrgIds.push(adminOrg.id);
+    const adminToken = await signOrgToken({ organizationId: adminOrg.id, type: 'admin' });
+
+    const requestRes = await request(
+      'POST',
+      '/api/tender-requests',
+      { title: 'Pipeline integration test tender', requiredCapacityMw: 5 },
+      buyerReg.body.token
+    );
+    expect(requestRes.status).toBe(200);
+    const tenderRequestId = requestRes.body.id;
+
+    // A buyer cannot create a tender directly any more — only an admin can.
+    const wrongRoleRes = await request(
+      'POST',
+      '/api/tenders',
+      { title: 'Should fail', requiredCapacityMw: 1, buyerOrgId: buyerReg.body.organizationId, rfsDocumentFeePaise: 100, bidProcessingFeePaise: 100, emdAmountPaise: 100, successChargePaise: 100 },
+      buyerReg.body.token
+    );
+    expect(wrongRoleRes.status).toBe(403);
+
+    // Admin converts the request into a real tender with its own per-tender pricing — matching +
+    // invitation is automatic at creation (no buyer curation step), so the already-registered,
+    // capacity-matching generator is auto-invited here.
     const tenderRes = await request(
       'POST',
       '/api/tenders',
-      { title: 'Pipeline integration test tender', requiredCapacityMw: 5 },
-      buyerReg.body.token
+      {
+        title: 'Pipeline integration test tender',
+        requiredCapacityMw: 5,
+        tenderRequestId,
+        rfsDocumentFeePaise: 100,
+        bidProcessingFeePaise: 100,
+        emdAmountPaise: 100,
+        successChargePaise: 100,
+      },
+      adminToken
     );
     expect(tenderRes.status).toBe(200);
     const tenderId = tenderRes.body.tenderId;
     createdTenderIds.push(tenderId);
     expect(tenderRes.body.autoInvitedOrganizationIds).toContain(generatorReg.body.organizationId);
 
-    // A generator org registered without a token cannot post a tender.
-    const wrongRoleRes = await request(
-      'POST',
-      '/api/tenders',
-      { title: 'Should fail', requiredCapacityMw: 1 },
-      generatorReg.body.token
-    );
-    expect(wrongRoleRes.status).toBe(403);
+    const convertedRequest = await TenderRequest.findByPk(tenderRequestId);
+    expect(convertedRequest!.status).toBe('converted');
+    expect(convertedRequest!.tenderId).toBe(tenderId);
 
-    // 3. Matching engine returns the registered generator (capacity-filtered, buyer-only view).
-    const matchesRes = await request('GET', `/api/tenders/${tenderId}/matches`, undefined, buyerReg.body.token);
+    // 3. Matching engine returns the registered generator (capacity-filtered, admin-only view — the
+    // buyer has no operational role in running a tender once they've requested it).
+    const matchesRes = await request('GET', `/api/tenders/${tenderId}/matches`, undefined, adminToken);
     expect(matchesRes.status).toBe(200);
     expect(matchesRes.body.matches.map((m: { organizationId: number }) => m.organizationId)).toContain(
       generatorReg.body.organizationId
@@ -265,10 +303,14 @@ describe('full minimal pipeline: registration -> tender -> matching -> vetting -
       'POST',
       `/api/tenders/${tenderId}/invitations/${generatorReg.body.organizationId}/settle-winner`,
       {},
-      buyerReg.body.token
+      adminToken
     );
-    expect(settleRes.status).toBe(200);
+    expect(settleRes.status).toBe(200); // settle-winner itself succeeds regardless of the refund attempt's own outcome
     const invitationAfter = await TenderInvitation.findOne({ where: { tenderId, organizationId: generatorReg.body.organizationId } });
-    expect(invitationAfter!.emdOutcome).toBe('refunded');
+    // Stays 'pending', not falsely 'refunded': refundEmd now actually calls Razorpay
+    // (services/paymentRefundService.ts), and step 3c's EMD Payment above has no real
+    // razorpayPaymentId to refund against — proving the outcome is never marked "refunded" without
+    // a real, successful refund. See tenders.test.ts for dedicated coverage of both rejection paths.
+    expect(invitationAfter!.emdOutcome).toBe('pending');
   });
 });

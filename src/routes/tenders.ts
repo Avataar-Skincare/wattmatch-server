@@ -5,6 +5,7 @@ import { z } from 'zod';
 import crypto from 'node:crypto';
 import { Tender } from '../models/Tender.js';
 import { Organization } from '../models/Organization.js';
+import { TenderRequest } from '../models/TenderRequest.js';
 import { TenderInvitation } from '../models/TenderInvitation.js';
 import { VettingBid } from '../models/VettingBid.js';
 import { Payment } from '../models/Payment.js';
@@ -22,11 +23,33 @@ const postLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHea
 const readLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
 const inviteLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
 
-const postTenderBodySchema = z.object({
+// Admin-only — see the route below. buyerOrgId/tenderRequestId: exactly one path to identify which
+// buyer this is for — either convert a pending request (buyerOrgId comes from the request itself)
+// or specify the buyer directly for an ad-hoc tender created without one.
+const postTenderBodySchema = z
+  .object({
+    title: z.string().trim().min(1, 'title is required').max(255),
+    requiredCapacityMw: z.number().positive('requiredCapacityMw must be a positive number'),
+    // Full requirement detail — deliberately separate from the teaser (title + capacity) any matched
+    // generator sees before being invited. See Tender.requirementsDetail's comment.
+    requirementsDetail: z.string().trim().max(20000).optional(),
+    buyerOrgId: z.number().int().positive().optional(),
+    tenderRequestId: z.number().int().positive().optional(),
+    // Per-tender pricing (TENDER_WORKFLOW_STAKEHOLDER_PLAN.md) — the whole point of admin-only
+    // creation is that these are a deliberate per-tender decision, so all four are required here
+    // even though the DB column itself has a fallback default for rows created other ways.
+    rfsDocumentFeePaise: z.number().int().nonnegative(),
+    bidProcessingFeePaise: z.number().int().nonnegative(),
+    emdAmountPaise: z.number().int().nonnegative(),
+    successChargePaise: z.number().int().nonnegative(),
+  })
+  .refine((data) => data.buyerOrgId !== undefined || data.tenderRequestId !== undefined, {
+    message: 'Either buyerOrgId or tenderRequestId is required',
+  });
+
+const tenderRequestBodySchema = z.object({
   title: z.string().trim().min(1, 'title is required').max(255),
   requiredCapacityMw: z.number().positive('requiredCapacityMw must be a positive number'),
-  // Full requirement detail — deliberately separate from the teaser (title + capacity) any matched
-  // generator sees before being invited. See Tender.requirementsDetail's comment.
   requirementsDetail: z.string().trim().max(20000).optional(),
 });
 
@@ -92,15 +115,98 @@ async function autoInviteEligibleGenerators(tender: Tender): Promise<number[]> {
   return invited;
 }
 
-// Buyer posts a tender requirement — see MINIMAL_PIPELINE_INTEGRATION_PLAN.md. Deliberately no
-// draft/review/publish workflow states — just enough to have a real tender id for the rest of the
-// pipeline (matching, invitations, vetting submissions, the auction bridge) to reference.
-router.post('/tenders', postLimiter, async (req, res, next) => {
+// A buyer submits a request describing what they want — not a live tender. An internal admin
+// reviews it and creates the real, priced Tender (see POST /tenders below). Replaces the old
+// buyer-self-service tender posting: buyers no longer set their own tender live directly.
+router.post('/tender-requests', postLimiter, async (req, res, next) => {
   try {
     const payload = await requireOrgAuth(req.headers.authorization);
     if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
     if (payload.type !== 'buyer') {
-      return res.status(403).json({ success: false, error: 'Only buyer organizations can post a tender' });
+      return res.status(403).json({ success: false, error: 'Only buyer organizations can request a tender' });
+    }
+
+    const parsed = tenderRequestBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
+    }
+
+    const request = await TenderRequest.create({
+      buyerOrgId: payload.organizationId,
+      title: parsed.data.title,
+      requiredCapacityMw: String(parsed.data.requiredCapacityMw),
+      requirementsDetail: parsed.data.requirementsDetail ?? null,
+    });
+
+    logger.info({ reqId: req.requestId, tenderRequestId: request.id, buyerOrgId: payload.organizationId }, '[TENDER_REQUEST] submitted');
+
+    res.json({ success: true, id: request.id, status: request.status });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// A buyer's own requests, including the resulting tenderId once an admin has converted one.
+router.get('/tender-requests/mine', readLimiter, async (req, res, next) => {
+  try {
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+    if (payload.type !== 'buyer') {
+      return res.status(403).json({ success: false, error: 'Only buyer organizations have this view' });
+    }
+
+    const requests = await TenderRequest.findAll({ where: { buyerOrgId: payload.organizationId }, order: [['id', 'DESC']] });
+    res.json({
+      success: true,
+      requests: requests.map((r) => ({
+        id: r.id,
+        title: r.title,
+        requiredCapacityMw: r.requiredCapacityMw,
+        status: r.status,
+        tenderId: r.tenderId,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin-only: every pending request awaiting conversion into a real tender.
+router.get('/tender-requests', readLimiter, async (req, res, next) => {
+  try {
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+    if (payload.type !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Only admin organizations have this view' });
+    }
+
+    const requests = await TenderRequest.findAll({ where: { status: 'pending' }, order: [['id', 'ASC']] });
+    res.json({
+      success: true,
+      requests: requests.map((r) => ({
+        id: r.id,
+        buyerOrgId: r.buyerOrgId,
+        title: r.title,
+        requiredCapacityMw: r.requiredCapacityMw,
+        requirementsDetail: r.requirementsDetail,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin creates the real, priced tender — see TENDER_WORKFLOW_STAKEHOLDER_PLAN.md and the decision
+// to move tender creation off self-service: a buyer no longer sets their own tender live, and fees
+// are set deliberately per tender (they vary tender to tender), not read from a platform-wide
+// stub. Either converts a pending TenderRequest (buyerOrgId comes from it) or creates one ad-hoc
+// with an explicit buyerOrgId, for cases handled outside the request flow (e.g. over a call).
+router.post('/tenders', postLimiter, async (req, res, next) => {
+  try {
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+    if (payload.type !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Only admin organizations can create a tender' });
     }
 
     const parsed = postTenderBodySchema.safeParse(req.body);
@@ -108,15 +214,34 @@ router.post('/tenders', postLimiter, async (req, res, next) => {
       return res.status(400).json({ success: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
     }
 
-    const org = await Organization.findByPk(payload.organizationId);
-    if (!org) return res.status(401).json({ success: false, error: 'Unknown organization' });
+    let buyerOrgId = parsed.data.buyerOrgId ?? null;
+    let request: TenderRequest | null = null;
+    if (parsed.data.tenderRequestId) {
+      request = await TenderRequest.findByPk(parsed.data.tenderRequestId);
+      if (!request) return res.status(404).json({ success: false, error: 'Tender request not found' });
+      if (request.status !== 'pending') {
+        return res.status(409).json({ success: false, error: `This request is already ${request.status}` });
+      }
+      buyerOrgId = request.buyerOrgId;
+    }
+
+    const buyerOrg = buyerOrgId ? await Organization.findByPk(buyerOrgId) : null;
+    if (!buyerOrg || buyerOrg.type !== 'buyer') {
+      return res.status(400).json({ success: false, error: 'buyerOrgId does not refer to a real buyer organization' });
+    }
 
     const tender = await Tender.create({
-      buyerOrgId: org.id,
+      buyerOrgId: buyerOrg.id,
       title: parsed.data.title,
       requiredCapacityMw: String(parsed.data.requiredCapacityMw),
       requirementsDetail: parsed.data.requirementsDetail ?? null,
+      rfsDocumentFeePaise: parsed.data.rfsDocumentFeePaise,
+      bidProcessingFeePaise: parsed.data.bidProcessingFeePaise,
+      emdAmountPaise: parsed.data.emdAmountPaise,
+      successChargePaise: parsed.data.successChargePaise,
     });
+
+    if (request) await request.update({ status: 'converted', tenderId: tender.id });
 
     // Stage 6.3's default document checklist — the buyer can add/delete fields afterward via
     // tenderDocuments.ts, but every tender starts from the plan's own default list rather than an
@@ -126,8 +251,8 @@ router.post('/tenders', postLimiter, async (req, res, next) => {
     const invitedOrganizationIds = await autoInviteEligibleGenerators(tender);
 
     logger.info(
-      { reqId: req.requestId, tenderId: tender.id, buyerOrgId: org.id, autoInvitedCount: invitedOrganizationIds.length },
-      '[TENDER] posted'
+      { reqId: req.requestId, tenderId: tender.id, buyerOrgId: buyerOrg.id, autoInvitedCount: invitedOrganizationIds.length },
+      '[TENDER] created by admin'
     );
 
     res.json({ success: true, tenderId: tender.id, autoInvitedOrganizationIds: invitedOrganizationIds });
@@ -270,7 +395,7 @@ router.post('/tenders/:id/enroll', inviteLimiter, async (req, res, next) => {
       passwordHash,
     });
 
-    await sendGeneratedCredentialsEmail(email, generatedPassword, frontendUrl('/login'));
+    await sendGeneratedCredentialsEmail(email, generatedPassword, frontendUrl('/complete-profile'));
 
     await TenderInvitation.findOrCreate({
       where: { tenderId: id, organizationId: org.id },
@@ -332,11 +457,12 @@ router.post('/tenders/:id/self-enroll', inviteLimiter, async (req, res, next) =>
 });
 
 // Matching engine — real, if simple: a generator matches if its self-declared capacity covers the
-// full requirement. Read-only buyer visibility now — invitations are sent automatically at tender
-// creation (see autoInviteEligibleGenerators above), the buyer does not curate/select who gets
-// invited (TENDER_WORKFLOW_STAKEHOLDER_PLAN.md Stage 4b). This endpoint just shows what the
-// automation already did. See MINIMAL_PIPELINE_INTEGRATION_PLAN.md for why deeper eligibility rules
-// (state regulatory compatibility, timeline fit) are a separate, larger, already-estimated build.
+// full requirement. Admin-only visibility — invitations are sent automatically at tender creation
+// (see autoInviteEligibleGenerators above); the buyer has no operational role in running a tender
+// once they've requested it, admin does (TENDER_WORKFLOW_STAKEHOLDER_PLAN.md Stage 4b). This
+// endpoint just shows what the automation already did. See MINIMAL_PIPELINE_INTEGRATION_PLAN.md for
+// why deeper eligibility rules (state regulatory compatibility, timeline fit) are a separate,
+// larger, already-estimated build.
 router.get('/tenders/:id/matches', readLimiter, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
@@ -347,8 +473,8 @@ router.get('/tenders/:id/matches', readLimiter, async (req, res, next) => {
 
     const tender = await Tender.findByPk(id);
     if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
-    if (payload.type !== 'buyer' || payload.organizationId !== tender.buyerOrgId) {
-      return res.status(403).json({ success: false, error: 'Only the owning buyer can view matches for this tender' });
+    if (payload.type !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Only admin organizations can view matches for this tender' });
     }
 
     const generators = await Organization.findAll({
@@ -495,7 +621,7 @@ router.post('/tenders/:id/invitations/respond', readLimiter, async (req, res, ne
 // boolean — the winner pays via the existing authenticated /payment/orders route (same as
 // bid_processing/emd), and this route just confirms that happened before refunding the EMD. It
 // deliberately does NOT forfeit on a missing payment — "hasn't paid yet" and "will never pay" are
-// different things, and only a human (the buyer, via declare-default below) can tell them apart.
+// different things, and only a human (admin, via declare-default below) can tell them apart.
 router.post('/tenders/:id/invitations/:organizationId/settle-winner', inviteLimiter, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
@@ -509,8 +635,8 @@ router.post('/tenders/:id/invitations/:organizationId/settle-winner', inviteLimi
 
     const tender = await Tender.findByPk(id);
     if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
-    if (payload.type !== 'buyer' || payload.organizationId !== tender.buyerOrgId) {
-      return res.status(403).json({ success: false, error: 'Only the owning buyer can settle the auction winner for this tender' });
+    if (payload.type !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Only admin organizations can settle the auction winner for this tender' });
     }
 
     const successChargePayment = await Payment.findOne({
@@ -520,18 +646,25 @@ router.post('/tenders/:id/invitations/:organizationId/settle-winner', inviteLimi
       return res.status(409).json({ success: false, error: 'The success charge has not been paid yet for this generator' });
     }
 
-    await refundEmd(id, organizationId, 'Won the auction and paid success charges');
+    const emdRefunded = await refundEmd(id, organizationId, 'Won the auction and paid success charges');
 
-    logger.info({ reqId: req.requestId, tenderId: id, organizationId }, '[TENDER] auction winner settled — success charge confirmed paid, EMD refunded');
+    logger.info(
+      { reqId: req.requestId, tenderId: id, organizationId, emdRefunded },
+      emdRefunded
+        ? '[TENDER] auction winner settled — success charge confirmed paid, EMD refunded'
+        : '[TENDER] auction winner settled — success charge confirmed paid, but the EMD refund did not succeed (see prior [EMD] log line)'
+    );
 
-    res.json({ success: true });
+    // emdRefunded reflects reality, not just "the request didn't throw" — a caller relying on this
+    // response to confirm the generator's money actually moved should check it, not just the 200.
+    res.json({ success: true, emdRefunded });
   } catch (err) {
     next(err);
   }
 });
 
-// The other branch of Stage 8's matrix: the buyer's own explicit call that the winner backed out
-// or failed to pay the success charge — a separate, deliberate action rather than inferring intent
+// The other branch of Stage 8's matrix: admin's own explicit call that the winner backed out or
+// failed to pay the success charge — a separate, deliberate action rather than inferring intent
 // from a missing payment (see settle-winner's comment above for why that distinction matters).
 router.post('/tenders/:id/invitations/:organizationId/declare-default', inviteLimiter, async (req, res, next) => {
   try {
@@ -546,8 +679,8 @@ router.post('/tenders/:id/invitations/:organizationId/declare-default', inviteLi
 
     const tender = await Tender.findByPk(id);
     if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
-    if (payload.type !== 'buyer' || payload.organizationId !== tender.buyerOrgId) {
-      return res.status(403).json({ success: false, error: 'Only the owning buyer can declare a default for this tender' });
+    if (payload.type !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Only admin organizations can declare a default for this tender' });
     }
 
     const successChargePayment = await Payment.findOne({

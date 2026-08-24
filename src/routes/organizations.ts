@@ -4,7 +4,7 @@ import { Op } from 'sequelize';
 import { z } from 'zod';
 import { Organization } from '../models/Organization.js';
 import { OrganizationToken } from '../models/OrganizationToken.js';
-import { signOrgToken } from '../lib/orgAuth.js';
+import { signOrgToken, verifyOrgToken, type OrgTokenPayload } from '../lib/orgAuth.js';
 import { hashPassword, verifyPassword, generateOpaqueToken, hashOpaqueToken } from '../lib/passwordAuth.js';
 import { sendEmailVerificationEmail, sendPasswordResetEmail } from '../services/email.js';
 import { logger } from '../lib/logger.js';
@@ -48,6 +48,30 @@ const resetPasswordBodySchema = z.object({
   token: z.string().min(1).max(500),
   newPassword: passwordSchema,
 });
+
+// Every field optional — this is a "fill in whatever's still missing" update, not a full replace.
+// Used by both a self-service "edit my profile" action and the account-less enrollment bridge's
+// completion prompt (tenders.ts's /enroll route only ever fills in what a Payment record already
+// captured, e.g. no capacityMw at all — see that route's own comment).
+const updateProfileBodySchema = z.object({
+  name: z.string().trim().min(1).max(MAX_STRING_FIELD_LENGTH).optional(),
+  contactPhone: z.string().trim().min(1).max(MAX_STRING_FIELD_LENGTH).optional(),
+  capacityMw: z.number().positive().optional(),
+});
+
+function extractBearerToken(authHeader: string | undefined): string | undefined {
+  return authHeader?.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : undefined;
+}
+
+async function requireOrgAuth(authHeader: string | undefined): Promise<OrgTokenPayload | null> {
+  const token = extractBearerToken(authHeader);
+  if (!token) return null;
+  try {
+    return await verifyOrgToken(token);
+  } catch {
+    return null;
+  }
+}
 
 const registerLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
 // Tight, specifically to blunt credential stuffing — the exact risk AUTH_STRATEGY_DECISIONS.md
@@ -215,6 +239,69 @@ router.post('/organizations/reset-password', tokenConsumeLimiter, async (req, re
     logger.info({ reqId: req.requestId, organizationId: record.organizationId }, '[ORG] password reset completed');
 
     res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// The account-less enrollment bridge (tenders.ts's POST /tenders/:id/enroll) auto-creates a
+// generator account from only what a Payment row captured — name, email, phone — with no
+// capacityMw at all, which silently means that org can never be picked up by the automated
+// matching engine (autoInviteEligibleGenerators requires capacityMw to compare against). This is
+// the completion step that closes that gap, and doubles as ordinary self-service profile editing
+// for any organization.
+router.get('/organizations/me', async (req, res, next) => {
+  try {
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+
+    const org = await Organization.findByPk(payload.organizationId);
+    if (!org) return res.status(401).json({ success: false, error: 'Unknown organization' });
+
+    res.json({
+      success: true,
+      organization: {
+        id: org.id,
+        type: org.type,
+        name: org.name,
+        contactEmail: org.contactEmail,
+        contactPhone: org.contactPhone,
+        capacityMw: org.capacityMw,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.patch('/organizations/me', async (req, res, next) => {
+  try {
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+
+    const parsed = updateProfileBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
+    }
+    if (parsed.data.capacityMw !== undefined && payload.type !== 'generator') {
+      return res.status(400).json({ success: false, error: 'capacityMw only applies to generator organizations' });
+    }
+
+    const org = await Organization.findByPk(payload.organizationId);
+    if (!org) return res.status(401).json({ success: false, error: 'Unknown organization' });
+
+    await org.update({
+      ...(parsed.data.name !== undefined ? { name: parsed.data.name } : {}),
+      ...(parsed.data.contactPhone !== undefined ? { contactPhone: parsed.data.contactPhone } : {}),
+      ...(parsed.data.capacityMw !== undefined ? { capacityMw: String(parsed.data.capacityMw) } : {}),
+    });
+
+    logger.info({ reqId: req.requestId, organizationId: org.id, fields: Object.keys(parsed.data) }, '[ORG] profile updated');
+
+    res.json({
+      success: true,
+      organization: { id: org.id, type: org.type, name: org.name, contactEmail: org.contactEmail, contactPhone: org.contactPhone, capacityMw: org.capacityMw },
+    });
   } catch (err) {
     next(err);
   }

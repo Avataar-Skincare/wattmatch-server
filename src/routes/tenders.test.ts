@@ -11,6 +11,7 @@ let server: ReturnType<express.Express['listen']>;
 let baseUrl: string;
 let buyerOrgId: number;
 let buyerToken: string;
+let adminToken: string;
 let tenderId: number;
 
 const createdOrgIds: number[] = [];
@@ -36,6 +37,10 @@ beforeAll(async () => {
   buyerOrgId = buyer.id;
   buyerToken = await signOrgToken({ organizationId: buyer.id, type: 'buyer' });
   createdOrgIds.push(buyer.id);
+
+  const admin = await Organization.create({ type: 'admin', name: 'Enroll Test Admin', contactEmail: `enroll-test-admin-${Date.now()}@test.local`, contactPhone: '9000000001' });
+  adminToken = await signOrgToken({ organizationId: admin.id, type: 'admin' });
+  createdOrgIds.push(admin.id);
 
   const tender = await Tender.create({ buyerOrgId, title: `Enroll test tender ${Date.now()}`, requiredCapacityMw: '5' });
   tenderId = tender.id;
@@ -146,16 +151,28 @@ describe('POST /tenders/:id/invitations/:organizationId/settle-winner and declar
     return org;
   }
 
+  it('rejects settle-winner and declare-default (403) for a buyer token — this is admin-only, buyers have no operational role here', async () => {
+    const org = await makeWinner();
+    const settleRes = await post(`/api/tenders/${tenderId}/invitations/${org.id}/settle-winner`, {}, buyerToken);
+    expect(settleRes.status).toBe(403);
+
+    const defaultRes = await post(`/api/tenders/${tenderId}/invitations/${org.id}/declare-default`, {}, buyerToken);
+    expect(defaultRes.status).toBe(403);
+
+    const invitation = await TenderInvitation.findOne({ where: { tenderId, organizationId: org.id } });
+    expect(invitation!.emdOutcome).toBe('pending'); // unchanged
+  });
+
   it('rejects settle-winner (409) when the success charge has not been paid yet', async () => {
     const org = await makeWinner();
-    const res = await post(`/api/tenders/${tenderId}/invitations/${org.id}/settle-winner`, {}, buyerToken);
+    const res = await post(`/api/tenders/${tenderId}/invitations/${org.id}/settle-winner`, {}, adminToken);
     expect(res.status).toBe(409);
 
     const invitation = await TenderInvitation.findOne({ where: { tenderId, organizationId: org.id } });
     expect(invitation!.emdOutcome).toBe('pending'); // unchanged
   });
 
-  it('refunds the EMD once a real paid success_charge Payment exists', async () => {
+  it('settle-winner succeeds, but leaves EMD outcome pending (not falsely "refunded") when no paid EMD payment exists to actually refund', async () => {
     const org = await makeWinner();
     await Payment.create({
       purpose: 'success_charge',
@@ -166,17 +183,54 @@ describe('POST /tenders/:id/invitations/:organizationId/settle-winner and declar
       currency: 'INR',
       status: 'paid',
     });
+    // Deliberately no 'emd' Payment created — refundEmd's own guard against silently marking
+    // "refunded" with nothing to actually refund kicks in (see emdOutcomeService.ts).
 
-    const res = await post(`/api/tenders/${tenderId}/invitations/${org.id}/settle-winner`, {}, buyerToken);
-    expect(res.status).toBe(200);
+    const res = await post(`/api/tenders/${tenderId}/invitations/${org.id}/settle-winner`, {}, adminToken);
+    expect(res.status).toBe(200); // settle-winner itself succeeds regardless of the refund attempt's own outcome
+    expect(res.body.emdRefunded).toBe(false);
 
     const invitation = await TenderInvitation.findOne({ where: { tenderId, organizationId: org.id } });
-    expect(invitation!.emdOutcome).toBe('refunded');
+    expect(invitation!.emdOutcome).toBe('pending');
+  });
+
+  it('settle-winner leaves EMD outcome pending when the EMD payment on file cannot actually be refunded by Razorpay', async () => {
+    const org = await makeWinner();
+    await Payment.create({
+      purpose: 'success_charge',
+      tenderId,
+      organizationId: org.id,
+      razorpayOrderId: `order_SETTLE_TEST_SC_${Date.now()}`,
+      amountPaise: 100,
+      currency: 'INR',
+      status: 'paid',
+    });
+    // A synthetic razorpayPaymentId can never actually be refunded by Razorpay's real API — same
+    // limitation payments.test.ts's own refund-rejection test documents (there's no way to get a
+    // genuinely refundable payment without a real checkout). This proves refundEmd doesn't lie
+    // about the outcome when the real refund call fails.
+    await Payment.create({
+      purpose: 'emd',
+      tenderId,
+      organizationId: org.id,
+      razorpayOrderId: `order_SETTLE_TEST_EMD_${Date.now()}`,
+      razorpayPaymentId: `pay_FAKE_${Date.now()}`,
+      amountPaise: 100,
+      currency: 'INR',
+      status: 'paid',
+    });
+
+    const res = await post(`/api/tenders/${tenderId}/invitations/${org.id}/settle-winner`, {}, adminToken);
+    expect(res.status).toBe(200);
+    expect(res.body.emdRefunded).toBe(false);
+
+    const invitation = await TenderInvitation.findOne({ where: { tenderId, organizationId: org.id } });
+    expect(invitation!.emdOutcome).toBe('pending');
   });
 
   it('forfeits the EMD via declare-default when the winner never pays', async () => {
     const org = await makeWinner();
-    const res = await post(`/api/tenders/${tenderId}/invitations/${org.id}/declare-default`, {}, buyerToken);
+    const res = await post(`/api/tenders/${tenderId}/invitations/${org.id}/declare-default`, {}, adminToken);
     expect(res.status).toBe(200);
 
     const invitation = await TenderInvitation.findOne({ where: { tenderId, organizationId: org.id } });
@@ -195,7 +249,7 @@ describe('POST /tenders/:id/invitations/:organizationId/settle-winner and declar
       status: 'paid',
     });
 
-    const res = await post(`/api/tenders/${tenderId}/invitations/${org.id}/declare-default`, {}, buyerToken);
+    const res = await post(`/api/tenders/${tenderId}/invitations/${org.id}/declare-default`, {}, adminToken);
     expect(res.status).toBe(409);
 
     const invitation = await TenderInvitation.findOne({ where: { tenderId, organizationId: org.id } });

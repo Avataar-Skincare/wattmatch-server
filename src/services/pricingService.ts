@@ -3,18 +3,13 @@ import { Organization } from '../models/Organization.js';
 import type { PaymentPurpose } from '../models/Payment.js';
 
 // Single source of truth for money — every amount charged anywhere in the payment module comes
-// from here, never from client input. The commission/fee model isn't finalized yet
-// (TENDER_WORKFLOW_STAKEHOLDER_PLAN.md's fee sections describe the SHAPE — per-MW EMD rates,
-// flat processing fees — but no final numbers), so every purpose below is stubbed to a flat ₹1
-// pending that decision. The DB lookups are real and stay in place regardless: when real formulas
-// land, they read from the same `tender`/`organization` records already being fetched here — no
-// caller of computeAmountPaise() needs to change.
-//
-// TODO(pricing): replace every STUB_AMOUNT_PAISE return below with the real formula once the
-// commission model is finalized. Nothing else in the payment module should need to change when
-// that happens — that's the point of funneling every amount through this one function.
-
-const STUB_AMOUNT_PAISE = 100; // ₹1 — deliberately obvious placeholder, not a real fee
+// from here, never from client input. Per TENDER_WORKFLOW_STAKEHOLDER_PLAN.md, fees vary tender to
+// tender, so each amount is read directly off the Tender row itself — set deliberately by the
+// admin who creates it (routes/tenders.ts's admin-only POST /tenders), not computed by a formula
+// here. The DB lookups this function already did are what make that possible: when a genuinely
+// dynamic formula (e.g. a per-MW EMD rate against the generator's declared capacity) is wanted
+// later, it reads from the same `tender`/`organization` records already being fetched here — no
+// caller of computeAmountPaise() needs to change either way.
 
 export interface PricingContext {
   purpose: PaymentPurpose;
@@ -48,27 +43,28 @@ export async function computeAmountPaise(context: PricingContext): Promise<numbe
   }
 }
 
-// TODO(pricing): flat fee, likely tender-independent — confirm once decided.
-function computeRfsDocumentFeePaise(_tender: Tender): number {
-  return STUB_AMOUNT_PAISE;
+function computeRfsDocumentFeePaise(tender: Tender): number {
+  return tender.rfsDocumentFeePaise;
 }
 
-// TODO(pricing): plan references a per-MW rate against the generator's QUOTED capacity, capped —
-// see TENDER_WORKFLOW_STAKEHOLDER_PLAN.md's Payment & EMD data model (Bid Processing Fee).
-function computeBidProcessingFeePaise(_tender: Tender, _organization: Organization | null): number {
-  return STUB_AMOUNT_PAISE;
+// Flat per-tender amount, deliberately simpler than the plan's own reference to a per-MW rate
+// against the generator's quoted capacity — the admin sets one number per tender rather than a
+// formula. Revisit if a genuinely dynamic, capacity-scaled rate is ever wanted; the organization
+// lookup already happening in computeAmountPaise is what a future formula would need.
+function computeBidProcessingFeePaise(tender: Tender, _organization: Organization | null): number {
+  return tender.bidProcessingFeePaise;
 }
 
-// TODO(pricing): real EMD is capacity-based and technology-dependent (separate solar/wind/ESS
-// rates per the tender spec's precedent) — needs the organization's declared technology mix, which
-// isn't captured on Organization yet (only a single capacityMw field exists today).
-function computeEmdPaise(_tender: Tender, _organization: Organization | null): number {
-  return STUB_AMOUNT_PAISE;
+// Same simplification as above — a flat per-tender EMD amount the admin sets, not the plan's
+// capacity/technology-scaled formula (which would need a declared technology mix Organization
+// doesn't capture yet — only a single capacityMw field exists today).
+function computeEmdPaise(tender: Tender, _organization: Organization | null): number {
+  return tender.emdAmountPaise;
 }
 
 // TODO(pricing): success charge is two installments per the plan (50% within 30 days of award,
-// 50% before PPA execution) — this function currently prices a single full charge; splitting into
-// installments is a caller-side concern once the schedule is decided, not this function's.
-function computeSuccessChargePaise(_tender: Tender, _organization: Organization | null): number {
-  return STUB_AMOUNT_PAISE;
+// 50% before PPA execution) — this returns the single full per-tender amount the admin set;
+// splitting into installments is a caller-side concern once that schedule is actually built.
+function computeSuccessChargePaise(tender: Tender, _organization: Organization | null): number {
+  return tender.successChargePaise;
 }

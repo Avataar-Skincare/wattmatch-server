@@ -5,10 +5,11 @@ import { Op } from 'sequelize';
 import { Payment, type PaymentPurpose } from '../models/Payment.js';
 import { Tender } from '../models/Tender.js';
 import { computeAmountPaise } from '../services/pricingService.js';
-import { createOrder, verifyCallback, verifyWebhookSignature, refund as razorpayRefund } from '../lib/razorpayAdapter.js';
+import { createOrder, verifyCallback, verifyWebhookSignature } from '../lib/razorpayAdapter.js';
 import { processPaymentCaptured, processPaymentFailed, processRefundProcessed } from '../services/paymentWebhookService.js';
 import { transitionPayment } from '../services/paymentStateMachine.js';
 import { reconcileStalePayments } from '../services/paymentReconciliationService.js';
+import { refundPayment } from '../services/paymentRefundService.js';
 import { getRazorpayConfig } from '../lib/razorpayConfig.js';
 import { verifyOrgToken, type OrgTokenPayload } from '../lib/orgAuth.js';
 import { Invoice } from '../models/Invoice.js';
@@ -404,46 +405,14 @@ router.post('/payment/:id/refund', refundLimiter, async (req, res, next) => {
 
     const payment = await Payment.findByPk(id);
     if (!payment) return res.status(404).json({ success: false, error: 'Payment not found' });
-    if (payment.status !== 'paid') {
-      return res.status(409).json({ success: false, error: `Cannot refund a payment in status '${payment.status}' — only a paid payment can be refunded` });
-    }
-    if (!payment.razorpayPaymentId) {
-      // Should be unreachable (status is only ever 'paid' alongside a recorded payment id), but a
-      // refund call needs a real Razorpay payment id to act on — fail loudly rather than send a
-      // malformed request to Razorpay if this invariant is ever somehow violated.
-      return res.status(409).json({ success: false, error: 'Payment has no recorded razorpayPaymentId — cannot refund' });
+
+    const outcome = await refundPayment(payment, parsed.data.amountPaise);
+    if (!outcome.ok) {
+      const statusCode = outcome.reason === 'razorpay_rejected' ? 502 : 409;
+      return res.status(statusCode).json({ success: false, error: outcome.message });
     }
 
-    let result;
-    try {
-      result = await razorpayRefund({ paymentId: payment.razorpayPaymentId, amountPaise: parsed.data.amountPaise });
-    } catch (err) {
-      // A rejection from Razorpay itself (bad payment id, already fully refunded, insufficient
-      // account balance) is an expected, legitimate outcome — not a bug in this server. Surfacing
-      // it as a clear 502 with Razorpay's own description gives an admin something actionable,
-      // instead of the generic 500 the catch-all error handler would otherwise produce.
-      const description = (err as { error?: { description?: string } })?.error?.description;
-      logger.error({ reqId: req.requestId, paymentId: payment.id, razorpayPaymentId: payment.razorpayPaymentId, err }, '[PAYMENT] refund rejected by Razorpay');
-      return res.status(502).json({ success: false, error: description || 'Razorpay rejected this refund request' });
-    }
-
-    await payment.update({ razorpayRefundId: result.refundId });
-
-    // Instant refunds (most methods) come back already 'processed' — transition right away rather
-    // than waiting on a webhook that, for these, may never meaningfully add information. Pending
-    // refunds (some bank-transfer methods) stay 'paid' until the refund.processed webhook (Section
-    // 6) confirms completion — transitionPayment's own idempotency means whichever path fires first
-    // wins and the other is a safe no-op, exactly like every other dual browser/webhook path here.
-    if (result.status === 'processed') {
-      await transitionPayment(payment, 'refunded');
-    }
-
-    logger.info(
-      { reqId: req.requestId, paymentId: payment.id, refundId: result.refundId, razorpayStatus: result.status, amountPaise: parsed.data.amountPaise ?? payment.amountPaise },
-      '[PAYMENT] refund initiated'
-    );
-
-    res.json({ success: true, refundId: result.refundId, status: result.status });
+    res.json({ success: true, refundId: outcome.refundId, status: outcome.status });
   } catch (err) {
     next(err);
   }

@@ -128,7 +128,11 @@ export async function sendPasswordResetEmail(email: string, resetUrl: string): P
 // credentials are emailed automatically by Wattmatch's system." Used only for the account-less
 // RfS-Document-purchaser path (tenders.ts's POST /tenders/:id/enroll) — someone who already
 // registered themselves gets the normal verification-email flow above instead, never this one.
-export async function sendGeneratedCredentialsEmail(email: string, password: string, loginUrl: string): Promise<boolean> {
+// Points at "complete your profile" rather than a bare login link, since this account was built
+// from only what the RfS Document purchase captured — notably no declared generator capacity — so
+// it can't be picked up by the automated matching engine until the owner fills that in themselves
+// (see organizations.ts's PATCH /organizations/me).
+export async function sendGeneratedCredentialsEmail(email: string, password: string, completeProfileUrl: string): Promise<boolean> {
   const client = getTransporter();
   if (!client) {
     console.warn(`Credentials email not configured — skipping send. Generated password for ${email} is ${password}`);
@@ -138,9 +142,9 @@ export async function sendGeneratedCredentialsEmail(email: string, password: str
     await client.sendMail({
       from: fromAddress(),
       to: email,
-      subject: 'Your Wattmatch account has been created',
-      text: `An account has been created for you on Wattmatch so you could enroll in this tender.\n\nEmail: ${email}\nTemporary password: ${password}\n\nLog in here: ${loginUrl}\n\nYou can change this password any time from the login page's "Forgot password" link.`,
-      html: `<p>An account has been created for you on Wattmatch so you could enroll in this tender.</p><p>Email: ${email}<br>Temporary password: <strong>${password}</strong></p><p>Log in here: <a href="${loginUrl}">${loginUrl}</a></p><p>You can change this password any time from the login page's "Forgot password" link.</p>`,
+      subject: 'Your Wattmatch account has been created — complete your profile',
+      text: `An account has been created for you on Wattmatch so you could enroll in this tender.\n\nEmail: ${email}\nTemporary password: ${password}\n\nA few details (like your generation capacity) weren't captured when this account was created, so future tenders you're eligible for won't find you automatically until you fill them in.\n\nLog in and complete your profile here: ${completeProfileUrl}\n\nYou can change this password any time from the login page's "Forgot password" link.`,
+      html: `<p>An account has been created for you on Wattmatch so you could enroll in this tender.</p><p>Email: ${email}<br>Temporary password: <strong>${password}</strong></p><p>A few details (like your generation capacity) weren't captured when this account was created, so future tenders you're eligible for won't find you automatically until you fill them in.</p><p>Log in and complete your profile here: <a href="${completeProfileUrl}">${completeProfileUrl}</a></p><p>You can change this password any time from the login page's "Forgot password" link.</p>`,
     });
     return true;
   } catch (err) {

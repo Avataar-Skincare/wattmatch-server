@@ -1,7 +1,12 @@
 import { DataTypes, Model, type CreationOptional, type InferAttributes, type InferCreationAttributes } from 'sequelize';
 import { sequelize } from '../db/sequelize.js';
 
-export type OrganizationType = 'buyer' | 'generator';
+// 'admin' is WattMatch's own internal ops team — not publicly self-registered (see
+// routes/organizations.ts's registerBodySchema, which deliberately only allows 'buyer'/
+// 'generator'); created only via scripts/create-admin.mjs. Introduced so admins can create tenders
+// with real per-tender pricing (see routes/tenders.ts) using the exact same login/JWT/auth
+// machinery already built for buyer/generator orgs, rather than a separate auth system.
+export type OrganizationType = 'buyer' | 'generator' | 'admin';
 
 // Minimal registration record — see MINIMAL_PIPELINE_INTEGRATION_PLAN.md. Deliberately not the
 // real multi-tenancy model from PLATFORM_ESTIMATE.md (no separate User/team concept yet) — one
@@ -27,7 +32,7 @@ export class Organization extends Model<InferAttributes<Organization>, InferCrea
 Organization.init(
   {
     id: { type: DataTypes.INTEGER.UNSIGNED, autoIncrement: true, primaryKey: true },
-    type: { type: DataTypes.ENUM('buyer', 'generator'), allowNull: false },
+    type: { type: DataTypes.ENUM('buyer', 'generator', 'admin'), allowNull: false },
     name: { type: DataTypes.STRING, allowNull: false },
     contactEmail: { type: DataTypes.STRING, allowNull: false, unique: true },
     contactPhone: { type: DataTypes.STRING, allowNull: false },
