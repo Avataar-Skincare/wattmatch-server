@@ -8,21 +8,21 @@ import { logger } from '../lib/logger.js';
 const PURPOSE_LABELS: Record<PaymentPurpose, string> = {
   rfs_document: 'RfS Document (Bid Purchase) Fee',
   bid_processing: 'Bid Processing Fee',
-  emd: 'Earnest Money Deposit',
-  success_charge: 'Success Charge',
 };
 
-// Wattmatch does not yet hold a GSTIN (see PricingPage.tsx's own note) — issuing a document that
+// Legal name and registered address are fixed facts about the incorporated entity, not per-
+// environment config — hardcoded rather than sourced from env vars. GSTIN is the one exception:
+// Wattmatch does not yet hold one (see PricingPage.tsx's own note), and issuing a document that
 // claims to be a "Tax Invoice" with a fabricated or blank GSTIN would be actively misleading, not
 // just incomplete. Until WATTMATCH_GSTIN is configured this generates a clearly-labeled
 // provisional receipt with no tax charged instead; the moment that env var is set (post GST
 // registration), every subsequently generated document automatically becomes a real tax invoice —
-// nothing here needs code changes, just configuration.
+// nothing here needs a code change, just that one piece of configuration.
 function sellerDetails() {
   return {
-    name: process.env.WATTMATCH_LEGAL_NAME || '[Wattmatch legal entity name — pending incorporation/registration]',
+    name: 'Wattmatch Energy Private Limited',
     gstin: process.env.WATTMATCH_GSTIN || null,
-    address: process.env.WATTMATCH_REGISTERED_ADDRESS || '[Registered address pending]',
+    address: 'E-15 F/F, Nandwani S, Baba Balak Nath Marg, New Delhi, Delhi - 110021',
   };
 }
 

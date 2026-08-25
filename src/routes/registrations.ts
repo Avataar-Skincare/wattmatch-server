@@ -1,11 +1,56 @@
 import { Router } from 'express';
 import { GeneratorRegistration } from '../models/GeneratorRegistration.js';
 import { CIRegistration } from '../models/CIRegistration.js';
+import { Organization } from '../models/Organization.js';
+import { OrganizationToken } from '../models/OrganizationToken.js';
 import { handleCreateError } from '../lib/handleCreateError.js';
-import { sendRegistrationConfirmationEmail } from '../services/email.js';
+import { sendRegistrationConfirmationEmail, sendAccountCreatedEmail } from '../services/email.js';
+import { generateOpaqueToken } from '../lib/passwordAuth.js';
 import { isValidEmail, isValidPhone, isPositiveNumber, normalizePhone } from '../lib/validators.js';
 
 const router = Router();
+
+const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000; // matches organizations.ts's own TTL for this token purpose
+
+function frontendUrl(path: string): string {
+  const origin = process.env.CORS_ORIGIN ?? 'http://localhost:5173';
+  return `${origin}${path}`;
+}
+
+// These lead-capture forms never collect a password, so a real account (if one doesn't already
+// exist for this email) is created with none set, and the same 'password_reset'-purpose token
+// organizations.ts's forgot-password flow uses is issued immediately — /reset-password consumes it
+// identically either way, so no new backend mechanism is needed, just a different email framing
+// (sendAccountCreatedEmail vs sendPasswordResetEmail). Silently skipped if an account already
+// exists for this email — that person already has a way in, and implying a fresh account would be
+// misleading.
+async function createAccountAndSendSetPasswordEmail(
+  type: 'buyer' | 'generator',
+  name: string,
+  email: string,
+  phone: string,
+  capacityMw?: string
+): Promise<void> {
+  const existing = await Organization.findOne({ where: { contactEmail: email } });
+  if (existing) return;
+
+  const org = await Organization.create({
+    type,
+    name,
+    contactEmail: email,
+    contactPhone: phone,
+    capacityMw: type === 'generator' && capacityMw ? capacityMw : null,
+  });
+
+  const { token, tokenHash } = generateOpaqueToken();
+  await OrganizationToken.create({
+    organizationId: org.id,
+    purpose: 'password_reset',
+    tokenHash,
+    expiresAt: new Date(Date.now() + PASSWORD_RESET_TTL_MS),
+  });
+  await sendAccountCreatedEmail(email, frontendUrl(`/reset-password?token=${encodeURIComponent(token)}`));
+}
 
 router.post('/generator', async (req, res) => {
   try {
@@ -28,6 +73,7 @@ router.post('/generator', async (req, res) => {
       state: state || '', capacity: capacity || '', siteLocation, commissioningTimeline, certifications, message,
     });
     void sendRegistrationConfirmationEmail(email, 'generator');
+    void createAccountAndSendSetPasswordEmail('generator', company || name || email, email, number, capacity || undefined);
     res.status(201).json({ success: true, message: 'Generator registration saved successfully', id: registration.id, createdAt: registration.createdAt });
   } catch (err) {
     console.error('Failed to save generator registration:', err);
@@ -66,6 +112,7 @@ router.post('/ci', async (req, res) => {
       consentGiven: true, consentGivenAt: new Date(),
     });
     void sendRegistrationConfirmationEmail(email, 'ci');
+    void createAccountAndSendSetPasswordEmail('buyer', company || name || email, email, number);
     res.status(201).json({ success: true, message: 'CI registration saved successfully', id: registration.id, createdAt: registration.createdAt });
   } catch (err) {
     console.error('Failed to save CI registration:', err);

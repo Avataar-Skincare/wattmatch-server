@@ -59,7 +59,7 @@ const rfsDocumentOrderBodySchema = z
 
 const orgOrderBodySchema = z
   .object({
-    purpose: z.enum(['bid_processing', 'emd', 'success_charge']),
+    purpose: z.enum(['bid_processing']),
     tenderId: z.number().int().positive(),
   })
   .strict();
@@ -184,9 +184,9 @@ router.post('/payment/orders/rfs-document', orderLimiter, async (req, res, next)
   }
 });
 
-// Authenticated — Bid Processing Fee, EMD, and success charge all require a real, logged-in
-// organization. organizationId always comes from the verified token, NEVER from the request body —
-// otherwise any caller could create a payment order that looks like it belongs to a different org.
+// Authenticated — the Bid Processing Fee requires a real, logged-in organization. organizationId
+// always comes from the verified token, NEVER from the request body — otherwise any caller could
+// create a payment order that looks like it belongs to a different org.
 router.post('/payment/orders', orderLimiter, async (req, res, next) => {
   try {
     const payload = await requireOrgAuth(req.headers.authorization);
@@ -270,11 +270,11 @@ router.post('/payment/verify', verifyLimiter, async (req, res, next) => {
 
 // Invoice retrieval (Red Flag #6) — a short-lived signed URL, matching the plan's "accessed only
 // via short-lived signed URLs" storage spec for any document. Ownership check differs by payment
-// shape, same distinction Payment itself draws: an org-linked payment (bid_processing/emd/
-// success_charge) requires that org's auth token; an account-less rfs_document payment has no
-// organizationId to check against, so it's gated on the same payerEmail traceability the plan
-// already accepts as proportionate for that account-less Stage 3 flow (see
-// rfsDocumentAccessService.ts's identical reasoning).
+// shape, same distinction Payment itself draws: an org-linked payment (bid_processing) requires
+// that org's auth token; an account-less rfs_document payment has no organizationId to check
+// against, so it's gated on the same payerEmail traceability the plan already accepts as
+// proportionate for that account-less Stage 3 flow (see rfsDocumentAccessService.ts's identical
+// reasoning).
 const invoiceLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
 
 router.get('/payment/:id/invoice', invoiceLimiter, async (req, res, next) => {
@@ -362,15 +362,21 @@ router.post('/payment/webhook', webhookLimiter, async (req, res) => {
   }
 });
 
-// Admin-triggered reconciliation — no dedicated background job queue exists yet (see the tech-stack
+// Admin-only reconciliation — no dedicated background job queue exists yet (see the tech-stack
 // plan's "worth adding" note), so this is the "admin endpoint" half of Section 7's stated
-// alternatives, same unauthenticated-admin-action pattern already used elsewhere in this codebase
-// (auctionAdmin.ts, tenders.ts's settle-winner/declare-default). Finds every payment stuck in
-// 'created' for more than 30 minutes and asks Razorpay directly what actually happened to it.
+// alternatives, same admin-org-token pattern used throughout this codebase (tenders.ts,
+// tenderDocuments.ts, emdSubmissions.ts). Finds every payment stuck in 'created' for more than 30
+// minutes and asks Razorpay directly what actually happened to it.
 const reconcileLimiter = rateLimit({ windowMs: 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
 
 router.post('/payment/reconcile', reconcileLimiter, async (req, res, next) => {
   try {
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+    if (payload.type !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Only admin organizations can trigger reconciliation' });
+    }
+
     const result = await reconcileStalePayments();
     logger.info({ reqId: req.requestId, ...result }, '[PAYMENT] reconciliation run');
     res.json({ success: true, ...result });
@@ -379,12 +385,11 @@ router.post('/payment/reconcile', reconcileLimiter, async (req, res, next) => {
   }
 });
 
-// Admin-only refund — same unauthenticated-admin-action pattern used throughout this file (there is
-// no real admin auth mechanism built yet, see AUTH_STRATEGY_DECISIONS.md). Only a 'paid' payment can
-// be refunded — enforced through the shared state machine, not a bespoke check here, so this stays
-// consistent with every other transition in the module. amountPaise is optional: omit it for a full
-// refund, or provide it for a partial one — passed straight through to Razorpay, which validates it
-// against the original captured amount itself.
+// Admin-only refund — same admin-org-token pattern used throughout this codebase. Only a 'paid'
+// payment can be refunded — enforced through the shared state machine, not a bespoke check here, so
+// this stays consistent with every other transition in the module. amountPaise is optional: omit it
+// for a full refund, or provide it for a partial one — passed straight through to Razorpay, which
+// validates it against the original captured amount itself.
 const refundBodySchema = z
   .object({
     amountPaise: z.number().int().positive().optional(),
@@ -395,6 +400,12 @@ const refundLimiter = rateLimit({ windowMs: 60 * 1000, limit: 10, standardHeader
 
 router.post('/payment/:id/refund', refundLimiter, async (req, res, next) => {
   try {
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+    if (payload.type !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Only admin organizations can trigger a refund' });
+    }
+
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'Invalid payment id' });
 

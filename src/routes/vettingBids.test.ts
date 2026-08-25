@@ -8,6 +8,7 @@ import { Organization } from '../models/Organization.js';
 import { Tender } from '../models/Tender.js';
 import { TenderInvitation } from '../models/TenderInvitation.js';
 import { Payment } from '../models/Payment.js';
+import { EmdSubmission } from '../models/EmdSubmission.js';
 import { TenderDocumentField } from '../models/TenderDocumentField.js';
 import { TenderDocumentUpload } from '../models/TenderDocumentUpload.js';
 import { signOrgToken } from '../lib/orgAuth.js';
@@ -21,6 +22,7 @@ async function cleanupTender(tenderRef: string) {
   await VettingOpeningAttestation.destroy({ where: { tenderRef } });
   await TenderInvitation.destroy({ where: { tenderId: Number(tenderRef) } });
   await Payment.destroy({ where: { tenderId: Number(tenderRef) } });
+  await EmdSubmission.destroy({ where: { tenderId: Number(tenderRef) } });
   await TenderDocumentUpload.destroy({ where: { tenderId: Number(tenderRef) } });
   await TenderDocumentField.destroy({ where: { tenderId: Number(tenderRef) } });
   await Tender.destroy({ where: { id: Number(tenderRef) } });
@@ -63,29 +65,50 @@ afterAll(async () => {
 
 // Creates a real Tender + an 'accepted' invitation for the shared test generator, and returns its
 // id (as a string) to use as tenderRef — replaces the old free-string freshTenderRef() now that
-// submission requires tenderRef to reference a real, invited tender. Also pre-pays the Bid
-// Processing Fee and EMD, since submission (vettingBids.ts) is now gated on both — most tests here
-// are about ceremony/decryption mechanics, not the payment gate itself, so satisfying it up front
-// keeps them focused on what they're actually testing.
+// submission requires tenderRef to reference a real, invited tender. Also pre-satisfies the Bid
+// Processing Fee and EMD gates, since submission (vettingBids.ts) is now gated on both — most tests
+// here are about ceremony/decryption mechanics, not the gates themselves, so satisfying them up
+// front keeps tests focused on what they're actually testing.
 async function makeInvitedTender(): Promise<string> {
   const tender = await Tender.create({ buyerOrgId, title: `Test tender ${Date.now()}-${Math.random().toString(36).slice(2)}`, requiredCapacityMw: '1' });
   await TenderInvitation.create({ tenderId: tender.id, organizationId: generatorOrgId, status: 'accepted' });
-  await payRequiredFees(tender.id);
+  await payBidProcessingFee(tender.id);
+  await submitEmd(tender.id);
   return String(tender.id);
 }
 
-async function payRequiredFees(tenderId: number): Promise<void> {
-  for (const purpose of ['bid_processing', 'emd'] as const) {
-    await Payment.create({
-      purpose,
-      tenderId,
-      organizationId: generatorOrgId,
-      razorpayOrderId: `order_TEST_${purpose}_${tenderId}_${Math.random().toString(36).slice(2)}`,
-      amountPaise: 100,
-      currency: 'INR',
-      status: 'paid',
-    });
-  }
+async function payBidProcessingFee(tenderId: number): Promise<void> {
+  await Payment.create({
+    purpose: 'bid_processing',
+    tenderId,
+    organizationId: generatorOrgId,
+    razorpayOrderId: `order_TEST_bid_processing_${tenderId}_${Math.random().toString(36).slice(2)}`,
+    amountPaise: 100,
+    currency: 'INR',
+    status: 'paid',
+  });
+}
+
+// EMD is a document now (see EmdSubmission), not a Payment — creating the row directly here mirrors
+// what the real emdSubmissions.ts upload route leaves behind, without adding a real S3 dependency
+// to this ceremony-focused test file (emdSubmissions.test.ts covers the actual upload route).
+async function submitEmd(tenderId: number): Promise<void> {
+  await EmdSubmission.create({
+    tenderId,
+    organizationId: generatorOrgId,
+    bankName: 'Test Bank',
+    guaranteeNumber: `BG-${tenderId}`,
+    amountPaise: 100,
+    validUpto: '2027-01-01',
+    documentS3Key: `test/${tenderId}/bg.pdf`,
+    documentOriginalFilename: 'bg.pdf',
+    returnRecipientName: 'GEN-A',
+    returnAddressLine: '1 Test Street',
+    returnCity: 'Delhi',
+    returnState: 'Delhi',
+    returnPincode: '110021',
+    returnPhone: '9000000001',
+  });
 }
 
 function submitBid(tenderRef: string, technicalContent: string, financialContent: string) {
@@ -162,49 +185,44 @@ describe('vettingBids routes', () => {
     expect(res.status).toBe(403);
   });
 
-  it('rejects submission when required fees are unpaid, and names exactly which are missing', async () => {
-    const tender = await Tender.create({ buyerOrgId, title: `Unpaid fees ${Date.now()}`, requiredCapacityMw: '1' });
+  it('rejects submission when the Bid Processing Fee is unpaid', async () => {
+    const tender = await Tender.create({ buyerOrgId, title: `Unpaid fee ${Date.now()}`, requiredCapacityMw: '1' });
     tenderRef = String(tender.id);
     await TenderInvitation.create({ tenderId: tender.id, organizationId: generatorOrgId, status: 'accepted' });
-    // Deliberately no payRequiredFees() call — invited and accepted, but nothing paid yet.
+    await submitEmd(tender.id);
+    // Deliberately no payBidProcessingFee() call — invited, accepted, and EMD submitted, but the
+    // fee unpaid.
 
-    const bothMissing = await post('/api/vetting-bids', submitBid(tenderRef, '{"capacity":"5MW"}', '{"tariff":6.2}'), generatorToken);
-    expect(bothMissing.status).toBe(402);
-    expect(bothMissing.body.missingFees).toEqual(['Bid Processing Fee', 'EMD']);
+    const feeMissing = await post('/api/vetting-bids', submitBid(tenderRef, '{"capacity":"5MW"}', '{"tariff":6.2}'), generatorToken);
+    expect(feeMissing.status).toBe(402);
+    expect(feeMissing.body.missingFees).toEqual(['Bid Processing Fee']);
 
-    // Pay only one of the two — submission must still be rejected, naming just the other.
-    await Payment.create({
-      purpose: 'bid_processing',
-      tenderId: tender.id,
-      organizationId: generatorOrgId,
-      razorpayOrderId: `order_TEST_partial_${tender.id}`,
-      amountPaise: 100,
-      currency: 'INR',
-      status: 'paid',
-    });
-    const oneMissing = await post('/api/vetting-bids', submitBid(tenderRef, '{"capacity":"5MW"}', '{"tariff":6.2}'), generatorToken);
-    expect(oneMissing.status).toBe(402);
-    expect(oneMissing.body.missingFees).toEqual(['EMD']);
+    await payBidProcessingFee(tender.id);
+    const feePaid = await post('/api/vetting-bids', submitBid(tenderRef, '{"capacity":"5MW"}', '{"tariff":6.2}'), generatorToken);
+    expect(feePaid.status).toBe(200);
+  });
 
-    // Pay the second — submission now succeeds.
-    await Payment.create({
-      purpose: 'emd',
-      tenderId: tender.id,
-      organizationId: generatorOrgId,
-      razorpayOrderId: `order_TEST_partial2_${tender.id}`,
-      amountPaise: 100,
-      currency: 'INR',
-      status: 'paid',
-    });
-    const bothPaid = await post('/api/vetting-bids', submitBid(tenderRef, '{"capacity":"5MW"}', '{"tariff":6.2}'), generatorToken);
-    expect(bothPaid.status).toBe(200);
+  it('rejects submission when the EMD Bank Guarantee has not been submitted', async () => {
+    const tender = await Tender.create({ buyerOrgId, title: `No EMD ${Date.now()}`, requiredCapacityMw: '1' });
+    tenderRef = String(tender.id);
+    await TenderInvitation.create({ tenderId: tender.id, organizationId: generatorOrgId, status: 'accepted' });
+    await payBidProcessingFee(tender.id);
+    // Deliberately no submitEmd() call — fee paid, but no Bank Guarantee on file.
+
+    const emdMissing = await post('/api/vetting-bids', submitBid(tenderRef, '{"capacity":"5MW"}', '{"tariff":6.2}'), generatorToken);
+    expect(emdMissing.status).toBe(400);
+
+    await submitEmd(tender.id);
+    const emdSubmitted = await post('/api/vetting-bids', submitBid(tenderRef, '{"capacity":"5MW"}', '{"tariff":6.2}'), generatorToken);
+    expect(emdSubmitted.status).toBe(200);
   });
 
   it('rejects submission when required documents are missing, and names exactly which are missing', async () => {
     const tender = await Tender.create({ buyerOrgId, title: `Missing docs ${Date.now()}`, requiredCapacityMw: '1' });
     tenderRef = String(tender.id);
     await TenderInvitation.create({ tenderId: tender.id, organizationId: generatorOrgId, status: 'accepted' });
-    await payRequiredFees(tender.id);
+    await payBidProcessingFee(tender.id);
+    await submitEmd(tender.id);
 
     // Two required fields, one optional — created directly (not via POST /tenders, so the default
     // checklist isn't seeded) to keep this test's assertions short and specific.

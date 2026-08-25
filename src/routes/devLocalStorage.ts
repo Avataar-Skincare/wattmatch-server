@@ -15,6 +15,8 @@ router.get('/dev/local-storage/*', async (req, res) => {
   const bytes = await readObject(key);
   if (!bytes) return res.status(404).json({ success: false, error: 'Not found' });
   res.setHeader('Content-Type', 'application/pdf');
+  const filename = typeof req.query.filename === 'string' ? req.query.filename : undefined;
+  if (filename) res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.send(bytes);
 });
 

@@ -10,6 +10,7 @@ import { Auction } from '../models/Auction.js';
 import { AuctionParticipant } from '../models/AuctionParticipant.js';
 import { TenderInvitation } from '../models/TenderInvitation.js';
 import { Payment } from '../models/Payment.js';
+import { EmdSubmission } from '../models/EmdSubmission.js';
 import { TenderDocumentField } from '../models/TenderDocumentField.js';
 import { TenderDocumentUpload } from '../models/TenderDocumentUpload.js';
 import { TenderRequest } from '../models/TenderRequest.js';
@@ -59,6 +60,7 @@ afterAll(async () => {
     await VettingOpeningAttestation.destroy({ where: { tenderRef: String(id) } });
     await TenderInvitation.destroy({ where: { tenderId: id } });
     await Payment.destroy({ where: { tenderId: id } });
+    await EmdSubmission.destroy({ where: { tenderId: id } });
     await TenderDocumentUpload.destroy({ where: { tenderId: id } });
     await TenderDocumentField.destroy({ where: { tenderId: id } });
     await TenderRequest.destroy({ where: { tenderId: id } });
@@ -135,7 +137,7 @@ describe('full minimal pipeline: registration -> tender -> matching -> vetting -
     const wrongRoleRes = await request(
       'POST',
       '/api/tenders',
-      { title: 'Should fail', requiredCapacityMw: 1, buyerOrgId: buyerReg.body.organizationId, rfsDocumentFeePaise: 100, bidProcessingFeePaise: 100, emdAmountPaise: 100, successChargePaise: 100 },
+      { title: 'Should fail', requiredCapacityMw: 1, buyerOrgId: buyerReg.body.organizationId, rfsDocumentFeePaise: 100, bidProcessingFeePaise: 100, emdAmountPaise: 100 },
       buyerReg.body.token
     );
     expect(wrongRoleRes.status).toBe(403);
@@ -153,7 +155,6 @@ describe('full minimal pipeline: registration -> tender -> matching -> vetting -
         rfsDocumentFeePaise: 100,
         bidProcessingFeePaise: 100,
         emdAmountPaise: 100,
-        successChargePaise: 100,
       },
       adminToken
     );
@@ -188,22 +189,41 @@ describe('full minimal pipeline: registration -> tender -> matching -> vetting -
     expect(respondRes.status).toBe(200);
     expect(respondRes.body.status).toBe('accepted');
 
-    // 3c. Pay the Bid Processing Fee and EMD — submission is now gated on both (see
-    // vettingBids.ts). Creating the Payment rows directly here (rather than through the real
-    // order+webhook HTTP flow, which needs live Razorpay credentials — see payments.test.ts for
-    // that full coverage) mirrors exactly what a captured webhook leaves behind, without adding a
-    // new external dependency to this broader pipeline test.
-    for (const purpose of ['bid_processing', 'emd'] as const) {
-      await Payment.create({
-        purpose,
-        tenderId,
-        organizationId: generatorReg.body.organizationId,
-        razorpayOrderId: `order_TEST_${purpose}_${tenderId}`,
-        amountPaise: 100,
-        currency: 'INR',
-        status: 'paid',
-      });
-    }
+    // 3c. Pay the Bid Processing Fee — submission is now gated on this (see vettingBids.ts).
+    // Creating the Payment row directly here (rather than through the real order+webhook HTTP
+    // flow, which needs live Razorpay credentials — see payments.test.ts for that full coverage)
+    // mirrors exactly what a captured webhook leaves behind, without adding a new external
+    // dependency to this broader pipeline test.
+    await Payment.create({
+      purpose: 'bid_processing',
+      tenderId,
+      organizationId: generatorReg.body.organizationId,
+      razorpayOrderId: `order_TEST_bid_processing_${tenderId}`,
+      amountPaise: 100,
+      currency: 'INR',
+      status: 'paid',
+    });
+
+    // 3c-ii. Submit the EMD — a document (Bank Guarantee), not a payment, since submission is also
+    // gated on this (see vettingBids.ts / EmdSubmission.ts). Creating the row directly here, same
+    // reasoning as above: proves the gate is satisfied without adding a real S3 dependency to this
+    // broader pipeline test (emdSubmissions.test.ts covers the actual upload route end to end).
+    await EmdSubmission.create({
+      tenderId,
+      organizationId: generatorReg.body.organizationId,
+      bankName: 'Test Bank',
+      guaranteeNumber: `BG-${tenderId}`,
+      amountPaise: 100,
+      validUpto: '2027-01-01',
+      documentS3Key: `test/${tenderId}/bg.pdf`,
+      documentOriginalFilename: 'bg.pdf',
+      returnRecipientName: 'Test Generator Co',
+      returnAddressLine: '1 Test Street',
+      returnCity: 'Delhi',
+      returnState: 'Delhi',
+      returnPincode: '110021',
+      returnPhone: '8888888888',
+    });
 
     // 3d. Satisfy the document checklist gate — posting the tender through the real HTTP route
     // above seeds the full default document-field registry (tenderDocuments.ts), so submission is
@@ -282,35 +302,12 @@ describe('full minimal pipeline: registration -> tender -> matching -> vetting -
     const secondPromoteRes = await request('POST', `/api/vetting-bids/${tenderId}/promote-to-auction`, {});
     expect(secondPromoteRes.status).toBe(409);
 
-    // 8. EMD outcome matrix: still 'pending' pre-auction-close (nothing should have settled yet).
-    const invitationBefore = await TenderInvitation.findOne({ where: { tenderId, organizationId: generatorReg.body.organizationId } });
-    expect(invitationBefore!.emdOutcome).toBe('pending');
-
-    // Settling the winner now requires a REAL paid success_charge Payment row (see tenders.ts's
-    // settle-winner comment) — created directly here rather than through the full order+webhook
-    // HTTP flow, same reasoning as step 3c's fee payments above. The other branch (backing out ->
-    // forfeited via declare-default) is exercised in tenders.test.ts.
-    await Payment.create({
-      purpose: 'success_charge',
-      tenderId,
-      organizationId: generatorReg.body.organizationId,
-      razorpayOrderId: `order_TEST_success_charge_${tenderId}`,
-      amountPaise: 100,
-      currency: 'INR',
-      status: 'paid',
-    });
-    const settleRes = await request(
-      'POST',
-      `/api/tenders/${tenderId}/invitations/${generatorReg.body.organizationId}/settle-winner`,
-      {},
-      adminToken
-    );
-    expect(settleRes.status).toBe(200); // settle-winner itself succeeds regardless of the refund attempt's own outcome
-    const invitationAfter = await TenderInvitation.findOne({ where: { tenderId, organizationId: generatorReg.body.organizationId } });
-    // Stays 'pending', not falsely 'refunded': refundEmd now actually calls Razorpay
-    // (services/paymentRefundService.ts), and step 3c's EMD Payment above has no real
-    // razorpayPaymentId to refund against — proving the outcome is never marked "refunded" without
-    // a real, successful refund. See tenders.test.ts for dedicated coverage of both rejection paths.
-    expect(invitationAfter!.emdOutcome).toBe('pending');
+    // 8. EMD is a document now (see EmdSubmission), not money — settling the auction winner is no
+    // longer a dedicated route (success charge is dropped, and EMD has no Payment to refund any
+    // more). Resolving the winner's EMD is the same generic admin action every other generator's
+    // EMD uses — release/invoke via emdSubmissions.ts — exercised end to end in
+    // emdSubmissions.test.ts, not duplicated here.
+    const emdBefore = await EmdSubmission.findOne({ where: { tenderId, organizationId: generatorReg.body.organizationId } });
+    expect(emdBefore!.status).toBe('submitted');
   });
 });

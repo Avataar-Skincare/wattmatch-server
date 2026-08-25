@@ -20,6 +20,7 @@ import vettingAuctionBridgeRouter from './routes/vettingAuctionBridge.js';
 import organizationsRouter from './routes/organizations.js';
 import tendersRouter from './routes/tenders.js';
 import tenderDocumentsRouter from './routes/tenderDocuments.js';
+import emdSubmissionsRouter from './routes/emdSubmissions.js';
 import paymentsRouter from './routes/payments.js';
 import devLocalStorageRouter from './routes/devLocalStorage.js';
 import { setupAuctionSocket } from './sockets/auctionSocket.js';
@@ -97,7 +98,10 @@ app.use('/api', organizationsRouter);
 app.use('/api', tendersRouter);
 // Stage 6.1/6.2/6.3's document checklist — see TENDER_WORKFLOW_STAKEHOLDER_PLAN.md.
 app.use('/api', tenderDocumentsRouter);
-// Razorpay order creation — see TENDER_WORKFLOW_STAKEHOLDER_PLAN.md's Payment & EMD section.
+// EMD as a Bank Guarantee document, not money — see EmdSubmission's own comment.
+app.use('/api', emdSubmissionsRouter);
+// Razorpay order creation — RfS Document and Bid Processing fees only; EMD and Success Charge are
+// no longer real payments (see Payment.ts / EmdSubmission.ts).
 app.use('/api', paymentsRouter);
 // Dev-only stand-in for S3 signed-URL downloads when AWS_S3_BUCKET isn't configured — see
 // lib/s3.ts. Always inert (404s everything) once a real bucket is configured, so this is safe to

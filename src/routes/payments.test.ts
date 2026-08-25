@@ -17,6 +17,7 @@ let server: ReturnType<express.Express['listen']>;
 let baseUrl: string;
 let buyerOrgId: number;
 let buyerToken: string;
+let adminToken: string;
 let tenderId: number;
 
 const createdOrgIds: number[] = [];
@@ -48,6 +49,10 @@ beforeAll(async () => {
   buyerOrgId = buyer.id;
   createdOrgIds.push(buyer.id);
   buyerToken = await signOrgToken({ organizationId: buyer.id, type: 'buyer' });
+
+  const admin = await Organization.create({ type: 'admin', name: 'Payments Test Admin', contactEmail: `payments-test-admin-${Date.now()}@test.local`, contactPhone: '9000000001' });
+  createdOrgIds.push(admin.id);
+  adminToken = await signOrgToken({ organizationId: admin.id, type: 'admin' });
 
   const tender = await Tender.create({ buyerOrgId: buyer.id, title: `Payments test tender ${Date.now()}`, requiredCapacityMw: '5' });
   tenderId = tender.id;
@@ -119,7 +124,7 @@ describe.runIf(hasRazorpayConfig)('payments routes', () => {
   });
 
   it('rejects an authenticated order request with no token', async () => {
-    const res = await postJson('/api/payment/orders', { purpose: 'emd', tenderId });
+    const res = await postJson('/api/payment/orders', { purpose: 'bid_processing', tenderId });
     expect(res.status).toBe(401);
   });
 
@@ -235,19 +240,31 @@ describe.runIf(hasRazorpayConfig)('payments routes', () => {
     expect(payment!.status).toBe('failed');
   });
 
+  it('refund and reconcile both reject with no token, and with a non-admin (buyer) token', async () => {
+    const noTokenRefund = await postJson('/api/payment/1/refund', {});
+    expect(noTokenRefund.status).toBe(401);
+    const buyerRefund = await postJson('/api/payment/1/refund', {}, { Authorization: `Bearer ${buyerToken}` });
+    expect(buyerRefund.status).toBe(403);
+
+    const noTokenReconcile = await postJson('/api/payment/reconcile', {});
+    expect(noTokenReconcile.status).toBe(401);
+    const buyerReconcile = await postJson('/api/payment/reconcile', {}, { Authorization: `Bearer ${buyerToken}` });
+    expect(buyerReconcile.status).toBe(403);
+  });
+
   it('refund: rejects a payment that is not yet paid', async () => {
     const orderRes = await postJson('/api/payment/orders/rfs-document', { tenderId, payerName: 'H', payerEmail: 'h@test.local', ...RFS_STAGE3_FIELDS });
     const payment = await Payment.findOne({ where: { razorpayOrderId: orderRes.body.orderId } });
 
-    const res = await postJson(`/api/payment/${payment!.id}/refund`, {});
+    const res = await postJson(`/api/payment/${payment!.id}/refund`, {}, { Authorization: `Bearer ${adminToken}` });
     expect(res.status).toBe(409);
   });
 
   it('refund: rejects an invalid body and a nonexistent payment id', async () => {
-    const badBody = await postJson('/api/payment/1/refund', { amountPaise: -5 });
+    const badBody = await postJson('/api/payment/1/refund', { amountPaise: -5 }, { Authorization: `Bearer ${adminToken}` });
     expect(badBody.status).toBe(400);
 
-    const notFound = await postJson('/api/payment/999999999/refund', {});
+    const notFound = await postJson('/api/payment/999999999/refund', {}, { Authorization: `Bearer ${adminToken}` });
     expect(notFound.status).toBe(404);
   });
 
@@ -265,7 +282,7 @@ describe.runIf(hasRazorpayConfig)('payments routes', () => {
     const payment = await Payment.findOne({ where: { razorpayOrderId: orderRes.body.orderId } });
     expect(payment!.status).toBe('paid');
 
-    const refundRes = await postJson(`/api/payment/${payment!.id}/refund`, {});
+    const refundRes = await postJson(`/api/payment/${payment!.id}/refund`, {}, { Authorization: `Bearer ${adminToken}` });
     expect(refundRes.status).toBe(502);
 
     const after = await Payment.findOne({ where: { razorpayOrderId: orderRes.body.orderId } });

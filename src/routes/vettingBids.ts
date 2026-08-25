@@ -11,10 +11,10 @@ import { TenderInvitation } from '../models/TenderInvitation.js';
 import { Payment } from '../models/Payment.js';
 import { TenderDocumentField } from '../models/TenderDocumentField.js';
 import { TenderDocumentUpload } from '../models/TenderDocumentUpload.js';
+import { EmdSubmission } from '../models/EmdSubmission.js';
 import { reconstructPrivateKey, openEnvelope, type SealedEnvelope } from '../lib/vettingCrypto.js';
 import { encryptField } from '../lib/fieldEncryption.js';
 import { verifyOrgToken } from '../lib/orgAuth.js';
-import { refundEmd } from '../services/emdOutcomeService.js';
 import { logger } from '../lib/logger.js';
 
 const router = Router();
@@ -142,23 +142,27 @@ router.post('/vetting-bids', submitLimiter, async (req, res, next) => {
       return res.status(403).json({ success: false, error: 'You must accept this tender\'s invitation before submitting a bid' });
     }
 
-    // Payment gate (TENDER_WORKFLOW_STAKEHOLDER_PLAN.md Stage 6): the Bid Processing Fee and EMD
-    // are both due BEFORE final submission, not after — a technical/financial bid must never be
-    // accepted from a generator who hasn't paid both. e-KYC (also in that Stage 6 sequence) has no
-    // gate here yet — it's still blocked on a vendor decision, flagged elsewhere, not silently
-    // skipped.
-    const [bidProcessingPayment, emdPayment] = await Promise.all([
-      Payment.findOne({ where: { tenderId, organizationId: generatorOrg.id, purpose: 'bid_processing', status: 'paid' } }),
-      Payment.findOne({ where: { tenderId, organizationId: generatorOrg.id, purpose: 'emd', status: 'paid' } }),
-    ]);
-    const missingFees: string[] = [];
-    if (!bidProcessingPayment) missingFees.push('Bid Processing Fee');
-    if (!emdPayment) missingFees.push('EMD');
-    if (missingFees.length > 0) {
+    // Payment gate (TENDER_WORKFLOW_STAKEHOLDER_PLAN.md Stage 6): the Bid Processing Fee is due
+    // BEFORE final submission, not after. e-KYC (also in that Stage 6 sequence) has no gate here
+    // yet — it's still blocked on a vendor decision, flagged elsewhere, not silently skipped.
+    const bidProcessingPayment = await Payment.findOne({
+      where: { tenderId, organizationId: generatorOrg.id, purpose: 'bid_processing', status: 'paid' },
+    });
+    if (!bidProcessingPayment) {
       return res.status(402).json({
         success: false,
-        error: `The following fees must be paid before submitting a bid: ${missingFees.join(', ')}`,
-        missingFees,
+        error: 'The following fees must be paid before submitting a bid: Bid Processing Fee',
+        missingFees: ['Bid Processing Fee'],
+      });
+    }
+
+    // EMD gate — a document requirement, not a payment (see EmdSubmission's own comment): the
+    // generator must have already submitted its Bank Guarantee before a bid can be accepted.
+    const emdSubmission = await EmdSubmission.findOne({ where: { tenderId, organizationId: generatorOrg.id } });
+    if (!emdSubmission) {
+      return res.status(400).json({
+        success: false,
+        error: 'You must submit your EMD Bank Guarantee before submitting a bid',
       });
     }
 
@@ -295,14 +299,10 @@ router.post('/vetting-bids/:id/technical-decision', ceremonyLimiter, async (req,
       decidedAt,
     });
 
-    // EMD outcome matrix (TENDER_WORKFLOW_STAKEHOLDER_PLAN.md Stage 8): a technical rejection is an
-    // immediate, unconditional refund — no need to wait for an auction that will never happen.
-    if (decision === 'rejected') {
-      const tenderId = Number(bid.tenderRef);
-      if (Number.isFinite(tenderId) && bid.generatorOrgId) {
-        await refundEmd(tenderId, bid.generatorOrgId, 'Not approved at technical stage');
-      }
-    }
+    // EMD is a physical Bank Guarantee now, not money (see EmdSubmission) — a technical rejection
+    // no longer auto-refunds anything; admin sees this generator's EMD still 'submitted' in the
+    // EMD console (emdSubmissions.ts) and releases it manually, since returning a document is a
+    // real-world action, not a state flip this route can perform on its own.
 
     logger.info({ reqId: req.requestId, bidId: bid.id, tenderRef: bid.tenderRef, decision }, '[VETTING] technical decision recorded');
 

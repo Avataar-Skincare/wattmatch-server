@@ -1,23 +1,43 @@
-import { Router } from 'express';
+import { Router, type Request, type Response, type NextFunction } from 'express';
 import rateLimit from 'express-rate-limit';
+import multer from 'multer';
 import { Op } from 'sequelize';
 import { z } from 'zod';
-import crypto from 'node:crypto';
 import { Tender } from '../models/Tender.js';
 import { Organization } from '../models/Organization.js';
 import { TenderRequest } from '../models/TenderRequest.js';
 import { TenderInvitation } from '../models/TenderInvitation.js';
 import { VettingBid } from '../models/VettingBid.js';
 import { Payment } from '../models/Payment.js';
+import { EmdSubmission } from '../models/EmdSubmission.js';
+import { OrganizationToken } from '../models/OrganizationToken.js';
 import { verifyOrgToken, signOrgToken, type OrgTokenPayload } from '../lib/orgAuth.js';
-import { hashPassword } from '../lib/passwordAuth.js';
-import { sendTenderInvitationEmail, sendGeneratedCredentialsEmail } from '../services/email.js';
-import { refundEmd, forfeitEmd } from '../services/emdOutcomeService.js';
+import { generateOpaqueToken } from '../lib/passwordAuth.js';
+import { sendTenderInvitationEmail, sendAccountCreatedEmail } from '../services/email.js';
 import { hasRfsDocumentPaid } from '../services/rfsDocumentAccessService.js';
 import { seedDefaultDocumentFields } from '../services/defaultTenderDocumentFields.js';
+import { uploadObject, getSignedDownloadUrl } from '../lib/s3.js';
 import { logger } from '../lib/logger.js';
 
 const router = Router();
+
+// The two tender-level PDFs admin uploads at/after creation — the RfS document (free) and the
+// tender document (gated behind the RfS Document / Bid Purchase fee), as distinct from
+// tenderDocuments.ts's per-field bid-compliance checklist.
+const MAX_TENDER_DOCUMENT_BYTES = 10 * 1024 * 1024;
+const tenderDocumentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_TENDER_DOCUMENT_BYTES },
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype !== 'application/pdf') {
+      cb(new Error('Only PDF files are accepted'));
+      return;
+    }
+    cb(null, true);
+  },
+});
+
+const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000; // matches organizations.ts's own TTL for this token purpose
 
 const postLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
 const readLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
@@ -36,12 +56,12 @@ const postTenderBodySchema = z
     buyerOrgId: z.number().int().positive().optional(),
     tenderRequestId: z.number().int().positive().optional(),
     // Per-tender pricing (TENDER_WORKFLOW_STAKEHOLDER_PLAN.md) — the whole point of admin-only
-    // creation is that these are a deliberate per-tender decision, so all four are required here
+    // creation is that these are a deliberate per-tender decision, so all three are required here
     // even though the DB column itself has a fallback default for rows created other ways.
+    // emdAmountPaise is disclosure only now, not a payment amount — see EmdSubmission.
     rfsDocumentFeePaise: z.number().int().nonnegative(),
     bidProcessingFeePaise: z.number().int().nonnegative(),
     emdAmountPaise: z.number().int().nonnegative(),
-    successChargePaise: z.number().int().nonnegative(),
   })
   .refine((data) => data.buyerOrgId !== undefined || data.tenderRequestId !== undefined, {
     message: 'Either buyerOrgId or tenderRequestId is required',
@@ -238,7 +258,6 @@ router.post('/tenders', postLimiter, async (req, res, next) => {
       rfsDocumentFeePaise: parsed.data.rfsDocumentFeePaise,
       bidProcessingFeePaise: parsed.data.bidProcessingFeePaise,
       emdAmountPaise: parsed.data.emdAmountPaise,
-      successChargePaise: parsed.data.successChargePaise,
     });
 
     if (request) await request.update({ status: 'converted', tenderId: tender.id });
@@ -256,6 +275,64 @@ router.post('/tenders', postLimiter, async (req, res, next) => {
     );
 
     res.json({ success: true, tenderId: tender.id, autoInvitedOrganizationIds: invitedOrganizationIds });
+  } catch (err) {
+    next(err);
+  }
+});
+
+async function requireAdminOrg(authHeader: string | undefined): Promise<OrgTokenPayload | { error: true; status: number; message: string }> {
+  const payload = await requireOrgAuth(authHeader);
+  if (!payload) return { error: true, status: 401, message: 'Missing or invalid organization token' };
+  if (payload.type !== 'admin') return { error: true, status: 403, message: 'Only admin organizations can upload tender documents' };
+  return payload;
+}
+
+// Admin-only: upload/replace the free RfS document — publicly downloadable the moment it's set,
+// no purchase required (see GET /tenders/:id/rfs-document below).
+router.post('/tenders/:id/rfs-document', postLimiter, tenderDocumentUpload.single('file'), async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
+
+    const payload = await requireAdminOrg(req.headers.authorization);
+    if ('error' in payload) return res.status(payload.status).json({ success: false, error: payload.message });
+
+    const tender = await Tender.findByPk(id);
+    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
+    if (!req.file) return res.status(400).json({ success: false, error: 'A PDF file is required' });
+
+    const s3Key = `tenders/${id}/rfs-document-${Date.now()}-${req.file.originalname}`;
+    await uploadObject(s3Key, req.file.buffer, 'application/pdf');
+    await tender.update({ rfsDocumentS3Key: s3Key, rfsDocumentOriginalFilename: req.file.originalname });
+
+    logger.info({ reqId: req.requestId, tenderId: id }, '[TENDER] RfS document uploaded');
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin-only: upload/replace the tender document — stays behind the RfS Document / Bid Purchase
+// fee (see hasRfsDocumentPaid) even after upload; only GET /tenders/:id/tender-document ever
+// serves it, and that route checks payment first.
+router.post('/tenders/:id/tender-document', postLimiter, tenderDocumentUpload.single('file'), async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
+
+    const payload = await requireAdminOrg(req.headers.authorization);
+    if ('error' in payload) return res.status(payload.status).json({ success: false, error: payload.message });
+
+    const tender = await Tender.findByPk(id);
+    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
+    if (!req.file) return res.status(400).json({ success: false, error: 'A PDF file is required' });
+
+    const s3Key = `tenders/${id}/tender-document-${Date.now()}-${req.file.originalname}`;
+    await uploadObject(s3Key, req.file.buffer, 'application/pdf');
+    await tender.update({ tenderDocumentS3Key: s3Key, tenderDocumentOriginalFilename: req.file.originalname });
+
+    logger.info({ reqId: req.requestId, tenderId: id }, '[TENDER] tender document uploaded');
+    res.json({ success: true });
   } catch (err) {
     next(err);
   }
@@ -311,17 +388,23 @@ router.get('/tenders/mine', readLimiter, async (req, res, next) => {
     const invitations = await TenderInvitation.findAll({ where: { organizationId: org.id } });
     const invitationByTenderId = new Map(invitations.map((i) => [i.tenderId, i]));
 
+    const emdSubmissions = await EmdSubmission.findAll({ where: { organizationId: org.id } });
+    const emdByTenderId = new Map(emdSubmissions.map((s) => [s.tenderId, s]));
+
     const allTenders = await Tender.findAll({ order: [['id', 'DESC']] });
 
     const enrolled = allTenders
       .filter((t) => invitationByTenderId.get(t.id)?.status === 'accepted')
-      .map((t) => ({
-        id: t.id,
-        title: t.title,
-        requiredCapacityMw: t.requiredCapacityMw,
-        status: t.status,
-        stage: invitationByTenderId.get(t.id)!.emdOutcome !== 'pending' ? 'settled' : t.status,
-      }));
+      .map((t) => {
+        const emdStatus = emdByTenderId.get(t.id)?.status;
+        return {
+          id: t.id,
+          title: t.title,
+          requiredCapacityMw: t.requiredCapacityMw,
+          status: t.status,
+          stage: emdStatus && emdStatus !== 'submitted' ? 'settled' : t.status,
+        };
+      });
 
     const matchesCapacity = (t: Tender) => org.capacityMw !== null && Number(org.capacityMw) >= Number(t.requiredCapacityMw);
     const listed = [...allTenders]
@@ -336,6 +419,26 @@ router.get('/tenders/mine', readLimiter, async (req, res, next) => {
       }));
 
     res.json({ success: true, enrolled, listed });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin-only display hint for the "create tender" form — the id itself is a plain Postgres
+// auto-increment (Tender.ts), so this is just MAX(id)+1, not a reservation. A concurrent creation
+// could still land on this same id; that's fine for a UI hint, the DB sequence is the real source
+// of truth. Placed before the /tenders/:id... routes below, matching this file's existing
+// literal-path-before-param-path ordering (see /tenders/mine above vs /tenders/:id further down).
+router.get('/tenders/next-id', readLimiter, async (req, res, next) => {
+  try {
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+    if (payload.type !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Only admin organizations can see the next tender id' });
+    }
+
+    const maxId = (await Tender.max('id')) as number | null;
+    res.json({ success: true, nextTenderId: (maxId ?? 0) + 1 });
   } catch (err) {
     next(err);
   }
@@ -384,18 +487,25 @@ router.post('/tenders/:id/enroll', inviteLimiter, async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'contactPhone is required to create your account' });
     }
 
-    const generatedPassword = crypto.randomBytes(12).toString('base64url');
-    const passwordHash = await hashPassword(generatedPassword);
-
     const org = await Organization.create({
       type: 'generator',
       name: rfsPayment?.payerName || email,
       contactEmail: email,
       contactPhone,
-      passwordHash,
+      passwordHash: null,
     });
 
-    await sendGeneratedCredentialsEmail(email, generatedPassword, frontendUrl('/complete-profile'));
+    // Passwordless account, same as the marketing lead-capture forms (registrations.ts) — the
+    // caller is logged in immediately below via the returned bearer token regardless, this email
+    // is only what lets them log in again on a future visit.
+    const { token: setPasswordToken, tokenHash } = generateOpaqueToken();
+    await OrganizationToken.create({
+      organizationId: org.id,
+      purpose: 'password_reset',
+      tokenHash,
+      expiresAt: new Date(Date.now() + PASSWORD_RESET_TTL_MS),
+    });
+    await sendAccountCreatedEmail(email, frontendUrl(`/reset-password?token=${encodeURIComponent(setPasswordToken)}`));
 
     await TenderInvitation.findOrCreate({
       where: { tenderId: id, organizationId: org.id },
@@ -451,6 +561,129 @@ router.post('/tenders/:id/self-enroll', inviteLimiter, async (req, res, next) =>
     logger.info({ reqId: req.requestId, tenderId: id, organizationId: payload.organizationId }, '[TENDER] self-enrolled');
 
     res.json({ success: true, status: 'accepted' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Public tender detail (Stage 2's "anyone can open a tender and see its basic details") — unlike
+// GET /tenders/:id below, this is unauthenticated and deliberately returns only the teaser fields
+// plus per-tender pricing. Never requirementsDetail or buyer identity — those stay gated behind the
+// same fee-paid + invitation checks GET /tenders/:id already enforces, for the reasons described there.
+router.get('/tenders/:id/public', readLimiter, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
+
+    const tender = await Tender.findByPk(id);
+    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
+
+    res.json({
+      success: true,
+      tender: {
+        id: tender.id,
+        title: tender.title,
+        requiredCapacityMw: tender.requiredCapacityMw,
+        status: tender.status,
+        rfsDocumentFeePaise: tender.rfsDocumentFeePaise,
+        bidProcessingFeePaise: tender.bidProcessingFeePaise,
+        emdAmountPaise: tender.emdAmountPaise,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const purchaseStatusQuerySchema = z.object({
+  email: z.string().trim().toLowerCase().email().optional(),
+});
+
+// Backs the public tender-details page's purchase/enroll CTA — the enroll and self-enroll routes
+// above already run this same hasRfsDocumentPaid check as a side effect of enrolling, but there was
+// no read-only way to ask "would this email/account be allowed to enroll" without attempting it. A
+// logged-in generator is checked by their own contactEmail (mirrors self-enroll); anyone else must
+// supply the email they paid with (mirrors the account-less enroll bridge).
+router.get('/tenders/:id/purchase-status', readLimiter, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
+
+    const tender = await Tender.findByPk(id);
+    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
+
+    const parsed = purchaseStatusQuerySchema.safeParse(req.query);
+    if (!parsed.success) return res.status(400).json({ success: false, error: 'Invalid email' });
+
+    let email = parsed.data.email;
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (payload && payload.type === 'generator') {
+      const org = await Organization.findByPk(payload.organizationId);
+      if (org) email = org.contactEmail;
+    }
+
+    if (!email) return res.status(400).json({ success: false, error: 'email is required (or log in with a generator account)' });
+
+    const purchased = await hasRfsDocumentPaid(id, email);
+    res.json({ success: true, purchased });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Public — the RfS document is free to download the moment it's uploaded, no purchase required
+// (that's what distinguishes it from the tender document below).
+router.get('/tenders/:id/rfs-document', readLimiter, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
+
+    const tender = await Tender.findByPk(id);
+    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
+    if (!tender.rfsDocumentS3Key) {
+      return res.status(404).json({ success: false, error: 'No RfS document has been uploaded for this tender yet' });
+    }
+
+    const url = await getSignedDownloadUrl(tender.rfsDocumentS3Key, 300, tender.rfsDocumentOriginalFilename ?? undefined);
+    res.json({ success: true, url, filename: tender.rfsDocumentOriginalFilename });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Gated on the same hasRfsDocumentPaid check as enroll/self-enroll and purchase-status — same dual
+// path (logged-in generator's own contactEmail, or an explicit ?email= for the account-less buyer
+// who hasn't enrolled yet). This is also the "saved to their profile" access point: once paid,
+// this stays fetchable any time the generator is logged in, no separate copy needs to be stored.
+router.get('/tenders/:id/tender-document', readLimiter, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
+
+    const tender = await Tender.findByPk(id);
+    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
+    if (!tender.tenderDocumentS3Key) {
+      return res.status(404).json({ success: false, error: 'No tender document has been uploaded for this tender yet' });
+    }
+
+    const parsed = purchaseStatusQuerySchema.safeParse(req.query);
+    if (!parsed.success) return res.status(400).json({ success: false, error: 'Invalid email' });
+
+    let email = parsed.data.email;
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (payload && payload.type === 'generator') {
+      const org = await Organization.findByPk(payload.organizationId);
+      if (org) email = org.contactEmail;
+    }
+    if (!email) return res.status(400).json({ success: false, error: 'email is required (or log in with a generator account)' });
+
+    const purchased = await hasRfsDocumentPaid(id, email);
+    if (!purchased) {
+      return res.status(402).json({ success: false, error: "This tender's document hasn't been purchased with that email yet" });
+    }
+
+    const url = await getSignedDownloadUrl(tender.tenderDocumentS3Key, 300, tender.tenderDocumentOriginalFilename ?? undefined);
+    res.json({ success: true, url, filename: tender.tenderDocumentOriginalFilename });
   } catch (err) {
     next(err);
   }
@@ -615,89 +848,21 @@ router.post('/tenders/:id/invitations/respond', readLimiter, async (req, res, ne
   }
 });
 
-// TENDER_WORKFLOW_STAKEHOLDER_PLAN.md's Stage 8 matrix: the auction winner's EMD is left 'pending'
-// at close specifically so it can be settled here once the outcome is known. This now checks a
-// REAL Payment row (purpose 'success_charge', status 'paid') rather than trusting a client-supplied
-// boolean — the winner pays via the existing authenticated /payment/orders route (same as
-// bid_processing/emd), and this route just confirms that happened before refunding the EMD. It
-// deliberately does NOT forfeit on a missing payment — "hasn't paid yet" and "will never pay" are
-// different things, and only a human (admin, via declare-default below) can tell them apart.
-router.post('/tenders/:id/invitations/:organizationId/settle-winner', inviteLimiter, async (req, res, next) => {
-  try {
-    const id = Number(req.params.id);
-    const organizationId = Number(req.params.organizationId);
-    if (!Number.isFinite(id) || !Number.isFinite(organizationId)) {
-      return res.status(400).json({ success: false, error: 'Invalid tender or organization id' });
-    }
+// Settling an auction winner (or declaring one defaulted) used to be a dedicated route here, gated
+// on a Success Charge Payment. Success Charge is dropped from the platform (2026-08-25) and EMD is
+// now a document, not money (see EmdSubmission) — there is nothing left for a dedicated
+// settle-winner/declare-default route to gate on. Resolving a winner's EMD (release once genuinely
+// done, or invoke if they back out) is now just the same generic admin action every other generator
+// uses, via emdSubmissions.ts's release/invoke routes.
 
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-
-    const tender = await Tender.findByPk(id);
-    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
-    if (payload.type !== 'admin') {
-      return res.status(403).json({ success: false, error: 'Only admin organizations can settle the auction winner for this tender' });
-    }
-
-    const successChargePayment = await Payment.findOne({
-      where: { tenderId: id, organizationId, purpose: 'success_charge', status: 'paid' },
-    });
-    if (!successChargePayment) {
-      return res.status(409).json({ success: false, error: 'The success charge has not been paid yet for this generator' });
-    }
-
-    const emdRefunded = await refundEmd(id, organizationId, 'Won the auction and paid success charges');
-
-    logger.info(
-      { reqId: req.requestId, tenderId: id, organizationId, emdRefunded },
-      emdRefunded
-        ? '[TENDER] auction winner settled — success charge confirmed paid, EMD refunded'
-        : '[TENDER] auction winner settled — success charge confirmed paid, but the EMD refund did not succeed (see prior [EMD] log line)'
-    );
-
-    // emdRefunded reflects reality, not just "the request didn't throw" — a caller relying on this
-    // response to confirm the generator's money actually moved should check it, not just the 200.
-    res.json({ success: true, emdRefunded });
-  } catch (err) {
-    next(err);
+// Multer's fileFilter/limit errors surface via next(err) BEFORE the route handler ever runs (same
+// caveat as tenderDocuments.ts) — a wrong-file-type or too-large upload deserves a clean 400, not
+// index.ts's generic 500 catch-all.
+router.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+  if (err instanceof multer.MulterError || (err instanceof Error && err.message === 'Only PDF files are accepted')) {
+    return res.status(400).json({ success: false, error: err.message });
   }
-});
-
-// The other branch of Stage 8's matrix: admin's own explicit call that the winner backed out or
-// failed to pay the success charge — a separate, deliberate action rather than inferring intent
-// from a missing payment (see settle-winner's comment above for why that distinction matters).
-router.post('/tenders/:id/invitations/:organizationId/declare-default', inviteLimiter, async (req, res, next) => {
-  try {
-    const id = Number(req.params.id);
-    const organizationId = Number(req.params.organizationId);
-    if (!Number.isFinite(id) || !Number.isFinite(organizationId)) {
-      return res.status(400).json({ success: false, error: 'Invalid tender or organization id' });
-    }
-
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-
-    const tender = await Tender.findByPk(id);
-    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
-    if (payload.type !== 'admin') {
-      return res.status(403).json({ success: false, error: 'Only admin organizations can declare a default for this tender' });
-    }
-
-    const successChargePayment = await Payment.findOne({
-      where: { tenderId: id, organizationId, purpose: 'success_charge', status: 'paid' },
-    });
-    if (successChargePayment) {
-      return res.status(409).json({ success: false, error: 'The success charge has already been paid — use settle-winner instead' });
-    }
-
-    await forfeitEmd(id, organizationId, 'Won the auction, then backed out of success charges');
-
-    logger.info({ reqId: req.requestId, tenderId: id, organizationId }, '[TENDER] auction winner declared default — EMD forfeited');
-
-    res.json({ success: true });
-  } catch (err) {
-    next(err);
-  }
+  next(err);
 });
 
 export default router;

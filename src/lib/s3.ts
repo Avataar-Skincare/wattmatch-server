@@ -65,13 +65,29 @@ export async function readObject(key: string): Promise<Buffer | null> {
 // Local-storage fallback has no real signing/expiry — it's a dev-only stand-in served by
 // routes/devLocalStorage.ts, which itself refuses to serve anything once AWS_S3_BUCKET is set, so
 // this path is never reachable in production.
-export async function getSignedDownloadUrl(key: string, expiresInSeconds = 300): Promise<string> {
+export async function getSignedDownloadUrl(
+  key: string,
+  expiresInSeconds = 300,
+  downloadFilename?: string
+): Promise<string> {
   const bucket = bucketName();
   if (!bucket) {
     const base = process.env.PUBLIC_API_URL || 'http://localhost:4000';
-    return `${base}/api/dev/local-storage/${key}`;
+    const qs = downloadFilename ? `?filename=${encodeURIComponent(downloadFilename)}` : '';
+    return `${base}/api/dev/local-storage/${key}${qs}`;
   }
-  return getSignedUrl(getClient(), new GetObjectCommand({ Bucket: bucket, Key: key }), { expiresIn: expiresInSeconds });
+  return getSignedUrl(
+    getClient(),
+    new GetObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      // Forces an actual download (vs. the browser opening the PDF inline) when the caller wants
+      // one — e.g. the tender/RfS documents, as opposed to invoice/template previews that are fine
+      // opened in a new tab.
+      ...(downloadFilename ? { ResponseContentDisposition: `attachment; filename="${downloadFilename}"` } : {}),
+    }),
+    { expiresIn: expiresInSeconds }
+  );
 }
 
 export function isLocalStorageFallbackActive(): boolean {

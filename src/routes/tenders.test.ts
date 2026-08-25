@@ -4,14 +4,11 @@ import { Organization } from '../models/Organization.js';
 import { Tender } from '../models/Tender.js';
 import { TenderInvitation } from '../models/TenderInvitation.js';
 import { Payment } from '../models/Payment.js';
-import { signOrgToken } from '../lib/orgAuth.js';
 
 let app: express.Express;
 let server: ReturnType<express.Express['listen']>;
 let baseUrl: string;
 let buyerOrgId: number;
-let buyerToken: string;
-let adminToken: string;
 let tenderId: number;
 
 const createdOrgIds: number[] = [];
@@ -35,12 +32,7 @@ beforeAll(async () => {
 
   const buyer = await Organization.create({ type: 'buyer', name: 'Enroll Test Buyer', contactEmail: `enroll-test-buyer-${Date.now()}@test.local`, contactPhone: '9000000000' });
   buyerOrgId = buyer.id;
-  buyerToken = await signOrgToken({ organizationId: buyer.id, type: 'buyer' });
   createdOrgIds.push(buyer.id);
-
-  const admin = await Organization.create({ type: 'admin', name: 'Enroll Test Admin', contactEmail: `enroll-test-admin-${Date.now()}@test.local`, contactPhone: '9000000001' });
-  adminToken = await signOrgToken({ organizationId: admin.id, type: 'admin' });
-  createdOrgIds.push(admin.id);
 
   const tender = await Tender.create({ buyerOrgId, title: `Enroll test tender ${Date.now()}`, requiredCapacityMw: '5' });
   tenderId = tender.id;
@@ -135,124 +127,5 @@ describe('POST /tenders/:id/enroll', () => {
     const res = await post(`/api/tenders/${tenderId}/enroll`, { email });
     expect(res.status).toBe(409);
     expect(res.body.accountExists).toBe(true);
-  });
-});
-
-describe('POST /tenders/:id/invitations/:organizationId/settle-winner and declare-default', () => {
-  async function makeWinner() {
-    const org = await Organization.create({
-      type: 'generator',
-      name: 'Winner Org',
-      contactEmail: `winner-${Date.now()}-${Math.random()}@test.local`,
-      contactPhone: '9000000003',
-    });
-    createdOrgIds.push(org.id);
-    await TenderInvitation.create({ tenderId, organizationId: org.id, status: 'accepted', emdOutcome: 'pending' });
-    return org;
-  }
-
-  it('rejects settle-winner and declare-default (403) for a buyer token — this is admin-only, buyers have no operational role here', async () => {
-    const org = await makeWinner();
-    const settleRes = await post(`/api/tenders/${tenderId}/invitations/${org.id}/settle-winner`, {}, buyerToken);
-    expect(settleRes.status).toBe(403);
-
-    const defaultRes = await post(`/api/tenders/${tenderId}/invitations/${org.id}/declare-default`, {}, buyerToken);
-    expect(defaultRes.status).toBe(403);
-
-    const invitation = await TenderInvitation.findOne({ where: { tenderId, organizationId: org.id } });
-    expect(invitation!.emdOutcome).toBe('pending'); // unchanged
-  });
-
-  it('rejects settle-winner (409) when the success charge has not been paid yet', async () => {
-    const org = await makeWinner();
-    const res = await post(`/api/tenders/${tenderId}/invitations/${org.id}/settle-winner`, {}, adminToken);
-    expect(res.status).toBe(409);
-
-    const invitation = await TenderInvitation.findOne({ where: { tenderId, organizationId: org.id } });
-    expect(invitation!.emdOutcome).toBe('pending'); // unchanged
-  });
-
-  it('settle-winner succeeds, but leaves EMD outcome pending (not falsely "refunded") when no paid EMD payment exists to actually refund', async () => {
-    const org = await makeWinner();
-    await Payment.create({
-      purpose: 'success_charge',
-      tenderId,
-      organizationId: org.id,
-      razorpayOrderId: `order_SETTLE_TEST_${Date.now()}`,
-      amountPaise: 100,
-      currency: 'INR',
-      status: 'paid',
-    });
-    // Deliberately no 'emd' Payment created — refundEmd's own guard against silently marking
-    // "refunded" with nothing to actually refund kicks in (see emdOutcomeService.ts).
-
-    const res = await post(`/api/tenders/${tenderId}/invitations/${org.id}/settle-winner`, {}, adminToken);
-    expect(res.status).toBe(200); // settle-winner itself succeeds regardless of the refund attempt's own outcome
-    expect(res.body.emdRefunded).toBe(false);
-
-    const invitation = await TenderInvitation.findOne({ where: { tenderId, organizationId: org.id } });
-    expect(invitation!.emdOutcome).toBe('pending');
-  });
-
-  it('settle-winner leaves EMD outcome pending when the EMD payment on file cannot actually be refunded by Razorpay', async () => {
-    const org = await makeWinner();
-    await Payment.create({
-      purpose: 'success_charge',
-      tenderId,
-      organizationId: org.id,
-      razorpayOrderId: `order_SETTLE_TEST_SC_${Date.now()}`,
-      amountPaise: 100,
-      currency: 'INR',
-      status: 'paid',
-    });
-    // A synthetic razorpayPaymentId can never actually be refunded by Razorpay's real API — same
-    // limitation payments.test.ts's own refund-rejection test documents (there's no way to get a
-    // genuinely refundable payment without a real checkout). This proves refundEmd doesn't lie
-    // about the outcome when the real refund call fails.
-    await Payment.create({
-      purpose: 'emd',
-      tenderId,
-      organizationId: org.id,
-      razorpayOrderId: `order_SETTLE_TEST_EMD_${Date.now()}`,
-      razorpayPaymentId: `pay_FAKE_${Date.now()}`,
-      amountPaise: 100,
-      currency: 'INR',
-      status: 'paid',
-    });
-
-    const res = await post(`/api/tenders/${tenderId}/invitations/${org.id}/settle-winner`, {}, adminToken);
-    expect(res.status).toBe(200);
-    expect(res.body.emdRefunded).toBe(false);
-
-    const invitation = await TenderInvitation.findOne({ where: { tenderId, organizationId: org.id } });
-    expect(invitation!.emdOutcome).toBe('pending');
-  });
-
-  it('forfeits the EMD via declare-default when the winner never pays', async () => {
-    const org = await makeWinner();
-    const res = await post(`/api/tenders/${tenderId}/invitations/${org.id}/declare-default`, {}, adminToken);
-    expect(res.status).toBe(200);
-
-    const invitation = await TenderInvitation.findOne({ where: { tenderId, organizationId: org.id } });
-    expect(invitation!.emdOutcome).toBe('forfeited');
-  });
-
-  it('refuses declare-default (409) once the success charge has actually been paid', async () => {
-    const org = await makeWinner();
-    await Payment.create({
-      purpose: 'success_charge',
-      tenderId,
-      organizationId: org.id,
-      razorpayOrderId: `order_DECLARE_TEST_${Date.now()}`,
-      amountPaise: 100,
-      currency: 'INR',
-      status: 'paid',
-    });
-
-    const res = await post(`/api/tenders/${tenderId}/invitations/${org.id}/declare-default`, {}, adminToken);
-    expect(res.status).toBe(409);
-
-    const invitation = await TenderInvitation.findOne({ where: { tenderId, organizationId: org.id } });
-    expect(invitation!.emdOutcome).toBe('pending'); // unchanged — not forfeited
   });
 });

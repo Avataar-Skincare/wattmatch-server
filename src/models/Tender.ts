@@ -25,8 +25,17 @@ export class Tender extends Model<InferAttributes<Tender>, InferCreationAttribut
   // requires explicit values and never relies on this default.
   declare rfsDocumentFeePaise: CreationOptional<number>;
   declare bidProcessingFeePaise: CreationOptional<number>;
+  // Disclosed EMD requirement — no longer a Payment amount (EMD is a Bank Guarantee document, see
+  // EmdSubmission), just how large a BG a generator needs to arrange for this tender.
   declare emdAmountPaise: CreationOptional<number>;
-  declare successChargePaise: CreationOptional<number>;
+  // Two admin-uploaded PDFs, distinct in visibility: the RfS document is free to download the
+  // moment the tender is public (TenderDetailsPage), the tender document is gated behind the RfS
+  // Document / Bid Purchase fee (see hasRfsDocumentPaid) — both nullable since a tender can exist
+  // before either is uploaded.
+  declare rfsDocumentS3Key: string | null;
+  declare rfsDocumentOriginalFilename: string | null;
+  declare tenderDocumentS3Key: string | null;
+  declare tenderDocumentOriginalFilename: string | null;
   declare readonly createdAt: CreationOptional<Date>;
 }
 
@@ -43,7 +52,10 @@ Tender.init(
     rfsDocumentFeePaise: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false, defaultValue: PRICING_STUB_DEFAULT_PAISE },
     bidProcessingFeePaise: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false, defaultValue: PRICING_STUB_DEFAULT_PAISE },
     emdAmountPaise: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false, defaultValue: PRICING_STUB_DEFAULT_PAISE },
-    successChargePaise: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false, defaultValue: PRICING_STUB_DEFAULT_PAISE },
+    rfsDocumentS3Key: { type: DataTypes.STRING, allowNull: true },
+    rfsDocumentOriginalFilename: { type: DataTypes.STRING, allowNull: true },
+    tenderDocumentS3Key: { type: DataTypes.STRING, allowNull: true },
+    tenderDocumentOriginalFilename: { type: DataTypes.STRING, allowNull: true },
     createdAt: DataTypes.DATE,
   },
   {

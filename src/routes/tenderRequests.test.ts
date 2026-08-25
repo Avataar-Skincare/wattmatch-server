@@ -74,7 +74,7 @@ async function get(path: string, token?: string) {
   return { status: res.status, body: await res.json() };
 }
 
-const pricing = { rfsDocumentFeePaise: 500, bidProcessingFeePaise: 1000, emdAmountPaise: 200000, successChargePaise: 5000 };
+const pricing = { rfsDocumentFeePaise: 500, bidProcessingFeePaise: 1000, emdAmountPaise: 200000 };
 
 describe('tender requests + admin-only tender creation', () => {
   it('a buyer can submit a request, and see it in their own list', async () => {
@@ -119,7 +119,6 @@ describe('tender requests + admin-only tender creation', () => {
     expect(tender!.rfsDocumentFeePaise).toBe(500);
     expect(tender!.bidProcessingFeePaise).toBe(1000);
     expect(tender!.emdAmountPaise).toBe(200000);
-    expect(tender!.successChargePaise).toBe(5000);
 
     const request = await TenderRequest.findByPk(tenderRequestId);
     expect(request!.status).toBe('converted');

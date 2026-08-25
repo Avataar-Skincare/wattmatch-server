@@ -8,9 +8,9 @@ export type RefundOutcome =
   | { ok: false; reason: 'not_paid' | 'missing_payment_id' | 'razorpay_rejected'; message: string };
 
 // Single source of truth for actually refunding a payment via Razorpay — used by the admin-
-// triggered POST /payment/:id/refund route AND emdOutcomeService.ts's refundEmd, so there is
-// exactly one place that calls Razorpay's refund API and transitions payment state, not two copies
-// that could silently drift apart. Extracted from routes/payments.ts, behavior unchanged.
+// triggered POST /payment/:id/refund route. EMD used to be refunded through here too, but EMD is
+// now a document, not money (see EmdSubmission.ts) — this is the only real-money refund path left.
+// Extracted from routes/payments.ts, behavior unchanged.
 export async function refundPayment(payment: Payment, amountPaise?: number): Promise<RefundOutcome> {
   if (payment.status !== 'paid') {
     return { ok: false, reason: 'not_paid', message: `Cannot refund a payment in status '${payment.status}' — only a paid payment can be refunded` };

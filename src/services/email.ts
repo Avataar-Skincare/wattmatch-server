@@ -124,31 +124,28 @@ export async function sendPasswordResetEmail(email: string, resetUrl: string): P
   }
 }
 
-// Stage 4 (TENDER_WORKFLOW_STAKEHOLDER_PLAN.md): "an account is compulsory — on creation, login
-// credentials are emailed automatically by Wattmatch's system." Used only for the account-less
-// RfS-Document-purchaser path (tenders.ts's POST /tenders/:id/enroll) — someone who already
-// registered themselves gets the normal verification-email flow above instead, never this one.
-// Points at "complete your profile" rather than a bare login link, since this account was built
-// from only what the RfS Document purchase captured — notably no declared generator capacity — so
-// it can't be picked up by the automated matching engine until the owner fills that in themselves
-// (see organizations.ts's PATCH /organizations/me).
-export async function sendGeneratedCredentialsEmail(email: string, password: string, completeProfileUrl: string): Promise<boolean> {
+// Sent when the marketing lead-capture forms (registrations.ts) also create a real Organization
+// account behind the scenes — the lead form never collects a password, so this reuses the same
+// 'password_reset'-purpose token/link the forgot-password flow uses (organizations.ts's
+// /reset-password consumes either indistinguishably), just framed as first-time setup rather than
+// a reset.
+export async function sendAccountCreatedEmail(email: string, setPasswordUrl: string): Promise<boolean> {
   const client = getTransporter();
   if (!client) {
-    console.warn(`Credentials email not configured — skipping send. Generated password for ${email} is ${password}`);
+    console.warn(`Account-created email not configured — skipping send. Set-password URL for ${email} is ${setPasswordUrl}`);
     return false;
   }
   try {
     await client.sendMail({
       from: fromAddress(),
       to: email,
-      subject: 'Your Wattmatch account has been created — complete your profile',
-      text: `An account has been created for you on Wattmatch so you could enroll in this tender.\n\nEmail: ${email}\nTemporary password: ${password}\n\nA few details (like your generation capacity) weren't captured when this account was created, so future tenders you're eligible for won't find you automatically until you fill them in.\n\nLog in and complete your profile here: ${completeProfileUrl}\n\nYou can change this password any time from the login page's "Forgot password" link.`,
-      html: `<p>An account has been created for you on Wattmatch so you could enroll in this tender.</p><p>Email: ${email}<br>Temporary password: <strong>${password}</strong></p><p>A few details (like your generation capacity) weren't captured when this account was created, so future tenders you're eligible for won't find you automatically until you fill them in.</p><p>Log in and complete your profile here: <a href="${completeProfileUrl}">${completeProfileUrl}</a></p><p>You can change this password any time from the login page's "Forgot password" link.</p>`,
+      subject: 'Your Wattmatch account is ready — set your password',
+      text: `Thanks for registering with Wattmatch. We've created your account — set a password to log in: ${setPasswordUrl}\n\nThis link expires in 1 hour. If you didn't register with us, ignore this email.`,
+      html: `<p>Thanks for registering with Wattmatch. We've created your account — set a password to log in.</p><p><a href="${setPasswordUrl}">${setPasswordUrl}</a></p><p>This link expires in 1 hour. If you didn't register with us, ignore this email.</p>`,
     });
     return true;
   } catch (err) {
-    console.error('Credentials email send failed:', err);
+    console.error('Account-created email send failed:', err);
     return false;
   }
 }

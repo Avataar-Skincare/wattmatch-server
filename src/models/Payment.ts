@@ -1,13 +1,15 @@
 import { DataTypes, Model, type CreationOptional, type InferAttributes, type InferCreationAttributes } from 'sequelize';
 import { sequelize } from '../db/sequelize.js';
 
-export type PaymentPurpose = 'rfs_document' | 'bid_processing' | 'emd' | 'success_charge';
+export type PaymentPurpose = 'rfs_document' | 'bid_processing';
 export type PaymentStatus = 'created' | 'attempted' | 'paid' | 'failed' | 'refunded';
 
-// One model for all four fee types in TENDER_WORKFLOW_STAKEHOLDER_PLAN.md, distinguished by
-// `purpose` rather than one row shape per fee — they share every field that actually matters
-// (amount, order/payment ids, status) and forcing four separate tables would just be four copies of
-// the same state machine. `organizationId` is nullable specifically for `rfs_document`: that
+// One model for both remaining real online-payment fee types, distinguished by `purpose` rather
+// than one row shape per fee — they share every field that actually matters (amount, order/payment
+// ids, status) and forcing separate tables would just be copies of the same state machine. EMD and
+// Success Charge used to be Payment purposes too; EMD is now a document (see EmdSubmission) and
+// Success Charge is dropped entirely (2026-08-25) — neither is real money moving through Razorpay
+// any more. `organizationId` is nullable specifically for `rfs_document`: that
 // purchase happens in Stage 3, before any account exists (see Tender.md's Stage 3), so there is no
 // organization row yet to reference — `payerName`/`payerEmail` capture identity for that case
 // instead, straight from the Stage 3 form.
@@ -52,7 +54,7 @@ export class Payment extends Model<InferAttributes<Payment>, InferCreationAttrib
 Payment.init(
   {
     id: { type: DataTypes.INTEGER.UNSIGNED, autoIncrement: true, primaryKey: true },
-    purpose: { type: DataTypes.ENUM('rfs_document', 'bid_processing', 'emd', 'success_charge'), allowNull: false },
+    purpose: { type: DataTypes.ENUM('rfs_document', 'bid_processing'), allowNull: false },
     tenderId: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false },
     organizationId: { type: DataTypes.INTEGER.UNSIGNED, allowNull: true },
     payerName: { type: DataTypes.STRING, allowNull: true },

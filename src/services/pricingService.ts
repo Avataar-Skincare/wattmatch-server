@@ -32,10 +32,6 @@ export async function computeAmountPaise(context: PricingContext): Promise<numbe
       return computeRfsDocumentFeePaise(tender);
     case 'bid_processing':
       return computeBidProcessingFeePaise(tender, organization);
-    case 'emd':
-      return computeEmdPaise(tender, organization);
-    case 'success_charge':
-      return computeSuccessChargePaise(tender, organization);
     default: {
       const exhaustiveCheck: never = context.purpose;
       throw new Error(`computeAmountPaise: unhandled purpose ${exhaustiveCheck as string}`);
@@ -53,18 +49,4 @@ function computeRfsDocumentFeePaise(tender: Tender): number {
 // lookup already happening in computeAmountPaise is what a future formula would need.
 function computeBidProcessingFeePaise(tender: Tender, _organization: Organization | null): number {
   return tender.bidProcessingFeePaise;
-}
-
-// Same simplification as above — a flat per-tender EMD amount the admin sets, not the plan's
-// capacity/technology-scaled formula (which would need a declared technology mix Organization
-// doesn't capture yet — only a single capacityMw field exists today).
-function computeEmdPaise(tender: Tender, _organization: Organization | null): number {
-  return tender.emdAmountPaise;
-}
-
-// TODO(pricing): success charge is two installments per the plan (50% within 30 days of award,
-// 50% before PPA execution) — this returns the single full per-tender amount the admin set;
-// splitting into installments is a caller-side concern once that schedule is actually built.
-function computeSuccessChargePaise(tender: Tender, _organization: Organization | null): number {
-  return tender.successChargePaise;
 }
