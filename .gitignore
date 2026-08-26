@@ -1,4 +1,5 @@
 node_modules
 dist
 .env
+.vetting-dev-shares.local.txt
 logs
