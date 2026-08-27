@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import rateLimit from 'express-rate-limit';
+import { z } from 'zod';
 import { VettingBid } from '../models/VettingBid.js';
 import { VettingDecidedRecord } from '../models/VettingDecidedRecord.js';
 import { VettingOpeningAttestation } from '../models/VettingOpeningAttestation.js';
@@ -27,6 +28,25 @@ function frontendUrl(path: string): string {
 const DEFAULT_WINDOW_SECONDS = 480;
 const DEFAULT_MAX_AUTO_EXTENSIONS = 8;
 
+// setTimeout's delay is a 32-bit signed int internally (~24.8 days is the real ceiling) — capped
+// well under that, both to stay safely inside it and because a "schedule this auction weeks out"
+// request is almost certainly a mistake for a live-bidding tool like this one.
+const MAX_SCHEDULE_AHEAD_MS = 20 * 24 * 60 * 60 * 1000;
+// scheduledStartAt is mandatory (§ product decision: an auction must never go live the moment it's
+// generated) — this is the minimum lead time a requested start must clear, so "schedule it" can't
+// be defeated by picking a time a second from now. Generous enough to rule out any realistic
+// request-latency false positive, small enough to never get in a real admin's way.
+const MIN_SCHEDULE_AHEAD_MS = 60 * 1000;
+
+const promoteBodySchema = z
+  .object({
+    // Required — ISO 8601 datetime string, matching what `Date.prototype.toISOString()` produces.
+    // No "omit this to start immediately" path any more: every auction this bridge creates must be
+    // scheduled for a real future time, never live the instant it's generated.
+    scheduledStartAt: z.string().datetime(),
+  })
+  .strict();
+
 // DELIBERATE DUPLICATION, not a refactor — see VETTING_TO_AUCTION_BRIDGE_PLAN.md. This
 // intentionally does NOT share code with auctionAdmin.ts's /auctions/seed route: that file is
 // working, tested, and directly relied on by live demos, and extracting a shared function from it
@@ -38,7 +58,8 @@ async function seedAuctionStandalone(
   title: string,
   openingBid: number,
   participants: Array<{ alias: string; organizationName: string; generatorOrgId: number | null }>,
-  tenderRef: number
+  tenderRef: number,
+  scheduledStartAt: Date
 ) {
   // Same ordering rationale already established for the manual seed route: create 'scheduled',
   // start the clock only once every participant has a real join link ready, flip to 'live' last.
@@ -78,7 +99,7 @@ async function seedAuctionStandalone(
       Organization.findByPk(p.generatorOrgId)
         .then((org) => {
           if (!org) return;
-          return sendAuctionJoinLinkEmail(org.contactEmail, title, frontendUrl(joinPath));
+          return sendAuctionJoinLinkEmail(org.contactEmail, title, frontendUrl(joinPath), scheduledStartAt);
         })
         .catch((err) => {
           logger.error({ err, auctionId: auction.id, generatorOrgId: p.generatorOrgId }, '[VETTING_BRIDGE] auction join-link email failed — auction unaffected');
@@ -86,10 +107,25 @@ async function seedAuctionStandalone(
     }
   }
 
-  const windowEndsAt = await startAuctionClock(auction.id, DEFAULT_WINDOW_SECONDS);
-  await Auction.update({ status: 'live' }, { where: { id: auction.id } });
+  // In-process timer only, same PoC bar as the rest of this internal bridge (see module comment)
+  // — a server restart between now and scheduledStartAt loses this timer and the auction is stuck
+  // 'scheduled' forever, needing a manual fix. Fine for this tool; a real deployment would need a
+  // persistent job (durable queue or a DB-polled scheduler) instead. The auction is created (and
+  // stays) 'scheduled' here — startAuctionClock/status:'live' only ever happen later, inside this
+  // timer, never at generation time.
+  const delayMs = scheduledStartAt.getTime() - Date.now();
+  setTimeout(() => {
+    startAuctionClock(auction.id, DEFAULT_WINDOW_SECONDS)
+      .then(() => Auction.update({ status: 'live' }, { where: { id: auction.id } }))
+      .then(() => {
+        logger.info({ auctionId: auction.id, scheduledStartAt }, '[VETTING_BRIDGE] scheduled auction went live');
+      })
+      .catch((err) => {
+        logger.error({ err, auctionId: auction.id }, '[VETTING_BRIDGE] scheduled auction failed to go live');
+      });
+  }, delayMs);
 
-  return { auctionId: auction.id, windowEndsAt, links };
+  return { auctionId: auction.id, scheduledStartAt: scheduledStartAt.toISOString(), links };
 }
 
 // Promotes a tender's approved, financially-opened generators into a live auction — see
@@ -99,6 +135,25 @@ router.post('/vetting-bids/:tenderRef/promote-to-auction', promoteLimiter, async
   try {
     const tenderRef = Number(req.params.tenderRef);
     if (!Number.isFinite(tenderRef)) return res.status(400).json({ success: false, error: 'Invalid tenderRef' });
+
+    const parsedBody = promoteBodySchema.safeParse(req.body ?? {});
+    if (!parsedBody.success) {
+      return res.status(400).json({ success: false, error: parsedBody.error.issues.map((i) => i.message).join('; ') });
+    }
+    const scheduledStartAt = new Date(parsedBody.data.scheduledStartAt);
+    const aheadMs = scheduledStartAt.getTime() - Date.now();
+    if (aheadMs < MIN_SCHEDULE_AHEAD_MS) {
+      return res.status(400).json({
+        success: false,
+        error: `Scheduled start must be at least ${MIN_SCHEDULE_AHEAD_MS / 1000} seconds from now — auctions are never generated live.`,
+      });
+    }
+    if (aheadMs > MAX_SCHEDULE_AHEAD_MS) {
+      return res.status(400).json({
+        success: false,
+        error: `Scheduled start must be within ${MAX_SCHEDULE_AHEAD_MS / (24 * 60 * 60 * 1000)} days from now`,
+      });
+    }
 
     const financialAttestation = await VettingOpeningAttestation.findOne({ where: { tenderRef: String(tenderRef), envelope: 'financial' } });
     if (!financialAttestation) {
@@ -146,7 +201,8 @@ router.post('/vetting-bids/:tenderRef/promote-to-auction', promoteLimiter, async
       `Tender #${tenderRef} auction`,
       openingBid,
       participants.map((p) => ({ alias: p.alias, organizationName: p.organizationName, generatorOrgId: p.generatorOrgId })),
-      tenderRef
+      tenderRef,
+      scheduledStartAt
     );
 
     logger.info(

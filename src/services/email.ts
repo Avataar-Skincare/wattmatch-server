@@ -154,19 +154,27 @@ export async function sendAccountCreatedEmail(email: string, setPasswordUrl: str
 // The join link itself is a signed, per-participant token (auctionTokens.ts) — this email is the
 // delivery mechanism the plan calls for, sent once per generator when their tender is promoted to
 // a live auction (vettingAuctionBridge.ts).
-export async function sendAuctionJoinLinkEmail(email: string, auctionTitle: string, joinUrl: string): Promise<boolean> {
+export async function sendAuctionJoinLinkEmail(
+  email: string,
+  auctionTitle: string,
+  joinUrl: string,
+  scheduledStartAt: Date | null = null
+): Promise<boolean> {
   const client = getTransporter();
   if (!client) {
     console.warn(`Auction join-link email not configured — skipping send. Join URL for ${email} is ${joinUrl}`);
     return false;
   }
+  const startsLine = scheduledStartAt
+    ? `It's scheduled to go live on ${scheduledStartAt.toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'Asia/Kolkata' })} (IST) — this link will let you in once bidding opens.`
+    : "It's live now.";
   try {
     await client.sendMail({
       from: fromAddress(),
       to: email,
       subject: `You're through to the live auction: "${auctionTitle}"`,
-      text: `Your bid was approved and the tender has moved to a live auction: "${auctionTitle}". Join here: ${joinUrl}\n\nThis link is unique to you — do not share it.`,
-      html: `<p>Your bid was approved and the tender has moved to a live auction: <strong>${auctionTitle}</strong>.</p><p>Join here: <a href="${joinUrl}">${joinUrl}</a></p><p>This link is unique to you — do not share it.</p>`,
+      text: `Your bid was approved and the tender has moved to a live auction: "${auctionTitle}". ${startsLine} Join here: ${joinUrl}\n\nThis link is unique to you — do not share it.`,
+      html: `<p>Your bid was approved and the tender has moved to a live auction: <strong>${auctionTitle}</strong>.</p><p>${startsLine}</p><p>Join here: <a href="${joinUrl}">${joinUrl}</a></p><p>This link is unique to you — do not share it.</p>`,
     });
     return true;
   } catch (err) {

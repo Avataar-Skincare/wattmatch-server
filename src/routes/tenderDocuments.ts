@@ -38,6 +38,13 @@ const upload = multer({
 const readLimiter = rateLimit({ windowMs: 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false });
 const writeLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false });
 
+// This endpoint is always multipart (see the POST route below), so `required` always arrives as
+// the literal string "true"/"false", never a real boolean — z.coerce.boolean() would coerce via
+// JS's Boolean(), under which the non-empty string "false" is truthy and silently becomes `true`.
+// Preprocessing to compare against the literal string first is what actually respects an
+// admin-unchecked "Required" checkbox instead of always saving the field as required.
+const stringBoolean = z.preprocess((v) => (typeof v === 'string' ? v === 'true' : v), z.boolean());
+
 const addFieldBodySchema = z.object({
   envelope: z.enum(['technical', 'financial']),
   key: z
@@ -47,7 +54,7 @@ const addFieldBodySchema = z.object({
     .max(100)
     .regex(/^[a-z0-9_]+$/, 'key must be lowercase letters, numbers, and underscores only'),
   label: z.string().trim().min(1, 'label is required').max(MAX_STRING_FIELD_LENGTH),
-  required: z.coerce.boolean().optional().default(true),
+  required: stringBoolean.optional().default(true),
 });
 
 function extractBearerToken(authHeader: string | undefined): string | undefined {
@@ -176,6 +183,88 @@ router.post('/tenders/:id/document-fields', writeLimiter, upload.single('templat
     logger.info({ reqId: req.requestId, tenderId, fieldId: field.id, key: field.key }, '[TENDER_DOCS] field added');
 
     res.json({ success: true, id: field.id });
+  } catch (err) {
+    next(err);
+  }
+});
+
+const updateFieldBodySchema = z.object({ required: stringBoolean });
+
+// Admin-only: flip a field's required/optional flag without deleting and re-adding it (Stage 6.3)
+// — re-adding via POST loses any uploads already made against the old row (DELETE cascades them),
+// which a pure required/optional toggle has no reason to throw away.
+router.patch('/tenders/:id/document-fields/:fieldId', writeLimiter, async (req, res, next) => {
+  try {
+    const tenderId = Number(req.params.id);
+    const fieldId = Number(req.params.fieldId);
+    if (!Number.isFinite(tenderId) || !Number.isFinite(fieldId)) {
+      return res.status(400).json({ success: false, error: 'Invalid tender or field id' });
+    }
+
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+
+    const tender = await Tender.findByPk(tenderId);
+    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
+    if (payload.type !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Only admin organizations can configure this tender\'s document fields' });
+    }
+
+    const parsed = updateFieldBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
+    }
+
+    const field = await TenderDocumentField.findOne({ where: { id: fieldId, tenderId } });
+    if (!field) return res.status(404).json({ success: false, error: 'Field not found for this tender' });
+
+    field.required = parsed.data.required;
+    await field.save();
+
+    logger.info({ reqId: req.requestId, tenderId, fieldId, required: field.required }, '[TENDER_DOCS] field required flag updated');
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin-only: upload or swap out a field's blank-format template PDF without deleting/re-adding the
+// field itself (which would cascade away any bidder uploads already made against it, per the DELETE
+// route below). Separate from the template optionally attached on POST /document-fields, which only
+// covers the moment a field is first created — this is the "replace it later" path.
+router.post('/tenders/:id/document-fields/:fieldId/template', writeLimiter, upload.single('template'), async (req, res, next) => {
+  try {
+    const tenderId = Number(req.params.id);
+    const fieldId = Number(req.params.fieldId);
+    if (!Number.isFinite(tenderId) || !Number.isFinite(fieldId)) {
+      return res.status(400).json({ success: false, error: 'Invalid tender or field id' });
+    }
+
+    const payload = await requireOrgAuth(req.headers.authorization);
+    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
+
+    const tender = await Tender.findByPk(tenderId);
+    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
+    if (payload.type !== 'admin') {
+      return res.status(403).json({ success: false, error: 'Only admin organizations can configure this tender\'s document fields' });
+    }
+
+    if (!req.file) return res.status(400).json({ success: false, error: 'A PDF template file is required' });
+
+    const field = await TenderDocumentField.findOne({ where: { id: fieldId, tenderId } });
+    if (!field) return res.status(404).json({ success: false, error: 'Field not found for this tender' });
+
+    const templateS3Key = s3KeyForTemplate(tenderId, fieldId, req.file.originalname);
+    await uploadObject(templateS3Key, req.file.buffer, 'application/pdf');
+
+    field.templateS3Key = templateS3Key;
+    field.templateOriginalFilename = req.file.originalname;
+    await field.save();
+
+    logger.info({ reqId: req.requestId, tenderId, fieldId }, '[TENDER_DOCS] field template replaced');
+
+    res.json({ success: true });
   } catch (err) {
     next(err);
   }

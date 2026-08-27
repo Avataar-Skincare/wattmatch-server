@@ -3,6 +3,7 @@ import { GeneratorRegistration } from '../models/GeneratorRegistration.js';
 import { CIRegistration } from '../models/CIRegistration.js';
 import { Organization } from '../models/Organization.js';
 import { OrganizationToken } from '../models/OrganizationToken.js';
+import { TenderRequest } from '../models/TenderRequest.js';
 import { handleCreateError } from '../lib/handleCreateError.js';
 import { sendRegistrationConfirmationEmail, sendAccountCreatedEmail } from '../services/email.js';
 import { generateOpaqueToken } from '../lib/passwordAuth.js';
@@ -24,15 +25,18 @@ function frontendUrl(path: string): string {
 // (sendAccountCreatedEmail vs sendPasswordResetEmail). Silently skipped if an account already
 // exists for this email — that person already has a way in, and implying a fresh account would be
 // misleading.
+// Returns the account either way (existing or freshly created) — the /ci caller needs a real
+// buyerOrgId to attach an auto-generated TenderRequest to, regardless of whether this particular
+// registration was the one that actually created the account.
 async function createAccountAndSendSetPasswordEmail(
   type: 'buyer' | 'generator',
   name: string,
   email: string,
   phone: string,
   capacityMw?: string
-): Promise<void> {
+): Promise<Organization> {
   const existing = await Organization.findOne({ where: { contactEmail: email } });
-  if (existing) return;
+  if (existing) return existing;
 
   const org = await Organization.create({
     type,
@@ -50,6 +54,7 @@ async function createAccountAndSendSetPasswordEmail(
     expiresAt: new Date(Date.now() + PASSWORD_RESET_TTL_MS),
   });
   await sendAccountCreatedEmail(email, frontendUrl(`/reset-password?token=${encodeURIComponent(token)}`));
+  return org;
 }
 
 router.post('/generator', async (req, res) => {
@@ -112,7 +117,34 @@ router.post('/ci', async (req, res) => {
       consentGiven: true, consentGivenAt: new Date(),
     });
     void sendRegistrationConfirmationEmail(email, 'ci');
-    void createAccountAndSendSetPasswordEmail('buyer', company || name || email, email, number);
+    const org = await createAccountAndSendSetPasswordEmail('buyer', company || name || email, email, number);
+
+    // Buyers no longer post a live tender themselves (see tenders.ts's own comment on this) — they
+    // submit a TenderRequest for an admin to price and convert. A buyer arriving through this
+    // marketing form would otherwise never see that step at all, so this creates one automatically
+    // from the demand-sizing fields the form already collects, landing it straight in the admin's
+    // "Pending tender requests" queue. Skipped when targetCapacity is blank — already validated
+    // above (line ~99) when present, so no re-check needed here — there's no sensible MW figure to
+    // invent for a tender-sizing document. Best-effort: a failure here shouldn't turn an otherwise
+    // successful registration into an error response.
+    if (targetCapacity) {
+      try {
+        const detailParts: string[] = [];
+        if (load) detailParts.push(`Monthly consumption: ${load} kWh`);
+        if (siteLocation) detailParts.push(`Site location: ${siteLocation}`);
+        if (tenurePreference) detailParts.push(`Preferred tenure: ${tenurePreference} years`);
+        if (message) detailParts.push(message);
+        await TenderRequest.create({
+          buyerOrgId: org.id,
+          title: `Tender request from ${company || name || email}`,
+          requiredCapacityMw: String(targetCapacity),
+          requirementsDetail: detailParts.length ? detailParts.join('\n') : null,
+        });
+      } catch (err) {
+        console.error(`Failed to auto-create tender request for CI registration ${registration.id}:`, err);
+      }
+    }
+
     res.status(201).json({ success: true, message: 'CI registration saved successfully', id: registration.id, createdAt: registration.createdAt });
   } catch (err) {
     console.error('Failed to save CI registration:', err);

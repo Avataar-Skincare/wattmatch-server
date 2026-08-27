@@ -281,16 +281,20 @@ describe('full minimal pipeline: registration -> tender -> matching -> vetting -
     expect(openFinancialRes.status).toBe(200);
     expect(openFinancialRes.body.opened).toHaveLength(1);
 
-    // 7. Promote the tender to a live auction — the actual connection point under test.
-    const promoteRes = await request('POST', `/api/vetting-bids/${tenderId}/promote-to-auction`, {});
+    // 7. Promote the tender to an auction — the actual connection point under test. Scheduling is
+    // mandatory (auctions never go live at generation time), so this needs a real future
+    // scheduledStartAt.
+    const scheduledStartAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    const promoteRes = await request('POST', `/api/vetting-bids/${tenderId}/promote-to-auction`, { scheduledStartAt });
     expect(promoteRes.status).toBe(200);
     expect(promoteRes.body.links).toHaveLength(1);
     expect(promoteRes.body.links[0].alias).toBe('Test Generator Co');
+    expect(promoteRes.body.scheduledStartAt).toBe(scheduledStartAt);
     createdAuctionIds.push(promoteRes.body.auctionId);
 
     const auction = await Auction.findByPk(promoteRes.body.auctionId);
     expect(auction).not.toBeNull();
-    expect(auction!.status).toBe('live');
+    expect(auction!.status).toBe('scheduled'); // stays scheduled — the in-process timer flips it to 'live' at scheduledStartAt, not here
     expect(Number(auction!.openingBid)).toBe(5.75); // the only approved generator's tariff
     expect(auction!.tenderRef).toBe(tenderId);
 
@@ -299,7 +303,7 @@ describe('full minimal pipeline: registration -> tender -> matching -> vetting -
     expect(participants[0].alias).toBe('Test Generator Co');
 
     // Promoting the same tender twice is rejected, not silently duplicated.
-    const secondPromoteRes = await request('POST', `/api/vetting-bids/${tenderId}/promote-to-auction`, {});
+    const secondPromoteRes = await request('POST', `/api/vetting-bids/${tenderId}/promote-to-auction`, { scheduledStartAt });
     expect(secondPromoteRes.status).toBe(409);
 
     // 8. EMD is a document now (see EmdSubmission), not money — settling the auction winner is no

@@ -760,6 +760,7 @@ router.get('/tenders/:id', readLimiter, async (req, res, next) => {
     let requirementsDetail: string | null = null;
     let buyer: { name: string; contactEmail: string; contactPhone: string } | null = null;
     let buyerLockedReason: string | null = null;
+    let bidProcessingPaid = false;
 
     if (payload.type === 'buyer') {
       if (payload.organizationId !== tender.buyerOrgId) {
@@ -778,6 +779,11 @@ router.get('/tenders/:id', readLimiter, async (req, res, next) => {
       const org = await Organization.findByPk(payload.organizationId);
       if (!org) return res.status(401).json({ success: false, error: 'Unknown organization' });
       const feesPaid = await hasRfsDocumentPaid(id, org.contactEmail);
+
+      const bidProcessingPayment = await Payment.findOne({
+        where: { tenderId: id, organizationId: payload.organizationId, purpose: 'bid_processing', status: 'paid' },
+      });
+      bidProcessingPaid = !!bidProcessingPayment;
 
       if (feesPaid) requirementsDetail = tender.requirementsDetail;
 
@@ -808,6 +814,7 @@ router.get('/tenders/:id', readLimiter, async (req, res, next) => {
       invitationStatus,
       buyer,
       buyerLockedReason,
+      bidProcessingPaid,
     });
   } catch (err) {
     next(err);

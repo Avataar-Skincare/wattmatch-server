@@ -3,3 +3,4 @@ dist
 .env
 .vetting-dev-shares.local.txt
 logs
+local-storage
