@@ -1,12 +1,13 @@
 import { Router } from 'express';
-import rateLimit from 'express-rate-limit';
+import { jsonRateLimit as rateLimit } from '../lib/rateLimit.js';
 import { Op } from 'sequelize';
 import { z } from 'zod';
 import { Organization } from '../models/Organization.js';
 import { OrganizationToken } from '../models/OrganizationToken.js';
-import { signOrgToken, verifyOrgToken, type OrgTokenPayload } from '../lib/orgAuth.js';
+import { signOrgToken } from '../lib/orgAuth.js';
 import { hashPassword, verifyPassword, generateOpaqueToken, hashOpaqueToken } from '../lib/passwordAuth.js';
-import { sendEmailVerificationEmail, sendPasswordResetEmail } from '../services/email.js';
+import { sendEmailVerificationEmail, sendPasswordResetEmail, sendAccountCreatedEmail } from '../services/email.js';
+import { authRequired } from '../middleware/auth.js';
 import { logger } from '../lib/logger.js';
 
 const router = Router();
@@ -59,26 +60,21 @@ const updateProfileBodySchema = z.object({
   capacityMw: z.number().positive().optional(),
 });
 
-function extractBearerToken(authHeader: string | undefined): string | undefined {
-  return authHeader?.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : undefined;
-}
-
-async function requireOrgAuth(authHeader: string | undefined): Promise<OrgTokenPayload | null> {
-  const token = extractBearerToken(authHeader);
-  if (!token) return null;
-  try {
-    return await verifyOrgToken(token);
-  } catch {
-    return null;
-  }
-}
+const adminInviteBodySchema = z.object({
+  name: z.string().trim().min(1, 'name is required').max(MAX_STRING_FIELD_LENGTH),
+  email: z.string().trim().toLowerCase().email('email must be valid').max(MAX_STRING_FIELD_LENGTH),
+  phone: z.string().trim().min(1, 'phone is required').max(MAX_STRING_FIELD_LENGTH),
+});
 
 const registerLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
-// Tight, specifically to blunt credential stuffing — the exact risk AUTH_STRATEGY_DECISIONS.md
-// names as newly real once every account type has a persistent reusable secret.
+// Tight, specifically to blunt credential stuffing — the one real risk that shows up once every
+// account type has a persistent reusable secret.
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
 const tokenRequestLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
 const tokenConsumeLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false });
+// Admin-inviting-admin is rare and consequential — tighter than registerLimiter, matching the bar
+// other admin-only consequential actions use elsewhere (e.g. payments.ts's refund/reconcile limiters).
+const adminInviteLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
 
 function frontendUrl(path: string): string {
   const origin = process.env.CORS_ORIGIN ?? 'http://localhost:5173';
@@ -250,44 +246,23 @@ router.post('/organizations/reset-password', tokenConsumeLimiter, async (req, re
 // matching engine (autoInviteEligibleGenerators requires capacityMw to compare against). This is
 // the completion step that closes that gap, and doubles as ordinary self-service profile editing
 // for any organization.
-router.get('/organizations/me', async (req, res, next) => {
-  try {
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-
-    const org = await Organization.findByPk(payload.organizationId);
-    if (!org) return res.status(401).json({ success: false, error: 'Unknown organization' });
-
-    res.json({
-      success: true,
-      organization: {
-        id: org.id,
-        type: org.type,
-        name: org.name,
-        contactEmail: org.contactEmail,
-        contactPhone: org.contactPhone,
-        capacityMw: org.capacityMw,
-      },
-    });
-  } catch (err) {
-    next(err);
-  }
+router.get('/organizations/me', ...authRequired(), async (req, res) => {
+  res.json({ success: true, organization: req.org });
 });
 
-router.patch('/organizations/me', async (req, res, next) => {
+router.patch('/organizations/me', ...authRequired(), async (req, res, next) => {
   try {
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-
     const parsed = updateProfileBodySchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ success: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
     }
-    if (parsed.data.capacityMw !== undefined && payload.type !== 'generator') {
+    if (parsed.data.capacityMw !== undefined && req.org!.type !== 'generator') {
       return res.status(400).json({ success: false, error: 'capacityMw only applies to generator organizations' });
     }
 
-    const org = await Organization.findByPk(payload.organizationId);
+    // requireAuth already confirmed this row exists this request; re-fetched here only because a
+    // mutable model instance (for .update()) is needed, not the plain snapshot on req.org.
+    const org = await Organization.findByPk(req.org!.id);
     if (!org) return res.status(401).json({ success: false, error: 'Unknown organization' });
 
     await org.update({
@@ -302,6 +277,51 @@ router.patch('/organizations/me', async (req, res, next) => {
       success: true,
       organization: { id: org.id, type: org.type, name: org.name, contactEmail: org.contactEmail, contactPhone: org.contactPhone, capacityMw: org.capacityMw },
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Admin provisioning, ongoing (after the very first admin — see scripts/create-admin.mjs for that
+// bootstrap step, which stays as the break-glass path since it needs no admin to already exist).
+// Any admin can invite another: same passwordless-account + set-password-email pattern already
+// used by registrations.ts's createAccountAndSendSetPasswordEmail and tenders.ts's enroll bridge,
+// just wired for type: 'admin' instead. No password is chosen here — the invitee sets their own
+// via the emailed reset-token link, so this route never sees or transmits a plaintext password.
+router.post('/organizations/admin-invite', adminInviteLimiter, ...authRequired('admin'), async (req, res, next) => {
+  try {
+    const parsed = adminInviteBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
+    }
+    const { name, email, phone } = parsed.data;
+
+    const existing = await Organization.findOne({ where: { contactEmail: email } });
+    if (existing) {
+      return res.status(409).json({ success: false, error: 'An organization with this email already exists' });
+    }
+
+    const admin = await Organization.create({
+      type: 'admin',
+      name,
+      contactEmail: email,
+      contactPhone: phone,
+      passwordHash: null,
+      emailVerified: true, // invited by a trusted admin, same reasoning as create-admin.mjs
+    });
+
+    const { token, tokenHash } = generateOpaqueToken();
+    await OrganizationToken.create({
+      organizationId: admin.id,
+      purpose: 'password_reset',
+      tokenHash,
+      expiresAt: new Date(Date.now() + PASSWORD_RESET_TTL_MS),
+    });
+    await sendAccountCreatedEmail(email, frontendUrl(`/reset-password?token=${encodeURIComponent(token)}`));
+
+    logger.info({ reqId: req.requestId, invitedAdminId: admin.id, invitedBy: req.org!.id }, '[ORG] admin invited');
+
+    res.json({ success: true, organizationId: admin.id });
   } catch (err) {
     next(err);
   }

@@ -1,11 +1,14 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import express from 'express';
-import { generateVettingKeypair, sealPayload } from '../lib/vettingCrypto.js';
+import crypto from 'node:crypto';
+import { generateVettingKeypair, sealPayload, reconstructPrivateKey, openEnvelope, type SealedEnvelope } from '../lib/vettingCrypto.js';
 import { Organization } from '../models/Organization.js';
 import { Tender } from '../models/Tender.js';
 import { VettingBid } from '../models/VettingBid.js';
 import { VettingOpeningAttestation } from '../models/VettingOpeningAttestation.js';
 import { VettingDecidedRecord } from '../models/VettingDecidedRecord.js';
+import { VettingCustodian } from '../models/VettingCustodian.js';
+import { VettingCustodianToken } from '../models/VettingCustodianToken.js';
 import { Auction } from '../models/Auction.js';
 import { AuctionParticipant } from '../models/AuctionParticipant.js';
 import { TenderInvitation } from '../models/TenderInvitation.js';
@@ -15,6 +18,7 @@ import { TenderDocumentField } from '../models/TenderDocumentField.js';
 import { TenderDocumentUpload } from '../models/TenderDocumentUpload.js';
 import { TenderRequest } from '../models/TenderRequest.js';
 import { signOrgToken } from '../lib/orgAuth.js';
+import { generateOpaqueToken } from '../lib/passwordAuth.js';
 
 // Proves the full minimal pipeline actually connects end to end — see
 // MINIMAL_PIPELINE_INTEGRATION_PLAN.md and VETTING_TO_AUCTION_BRIDGE_PLAN.md. Real MySQL/Redis,
@@ -26,6 +30,7 @@ let financialKey: Awaited<ReturnType<typeof generateVettingKeypair>>;
 const createdOrgIds: number[] = [];
 const createdTenderIds: number[] = [];
 const createdAuctionIds: number[] = [];
+const createdCustodianIds: number[] = [];
 
 beforeAll(async () => {
   technicalKey = await generateVettingKeypair();
@@ -38,6 +43,7 @@ beforeAll(async () => {
   const { default: organizationsRouter } = await import('./organizations.js');
   const { default: tendersRouter } = await import('./tenders.js');
   const { default: vettingBidsRouter } = await import('./vettingBids.js');
+  const { default: vettingCustodianRouter } = await import('./vettingCustodian.js');
   const { default: vettingAuctionBridgeRouter } = await import('./vettingAuctionBridge.js');
 
   app = express();
@@ -45,6 +51,7 @@ beforeAll(async () => {
   app.use('/api', organizationsRouter);
   app.use('/api', tendersRouter);
   app.use('/api', vettingBidsRouter);
+  app.use('/api', vettingCustodianRouter);
   app.use('/api', vettingAuctionBridgeRouter);
 });
 
@@ -58,6 +65,7 @@ afterAll(async () => {
     for (const bid of bids) await VettingDecidedRecord.destroy({ where: { vettingBidId: bid.id } });
     await VettingBid.destroy({ where: { tenderRef: String(id) } });
     await VettingOpeningAttestation.destroy({ where: { tenderRef: String(id) } });
+    await VettingCustodianToken.destroy({ where: { tenderId: id } });
     await TenderInvitation.destroy({ where: { tenderId: id } });
     await Payment.destroy({ where: { tenderId: id } });
     await EmdSubmission.destroy({ where: { tenderId: id } });
@@ -66,6 +74,7 @@ afterAll(async () => {
     await TenderRequest.destroy({ where: { tenderId: id } });
     await Tender.destroy({ where: { id } });
   }
+  for (const id of createdCustodianIds) await VettingCustodian.destroy({ where: { id } });
   for (const id of createdOrgIds) await Organization.destroy({ where: { id } });
 });
 
@@ -89,6 +98,11 @@ async function request(method: 'GET' | 'POST', path: string, body?: unknown, tok
 }
 
 describe('full minimal pipeline: registration -> tender -> matching -> vetting -> auction', () => {
+  // Longer than the global 15s default for two independent reasons: this test's real SMTP sends
+  // (registration/invitation emails) fail slowly against whatever mail credentials this environment
+  // has configured, and it now deliberately waits for real wall-clock time to cross the tender's
+  // scheduled technicalBidOpenAt/financialBidOpenAt before each custodian ceremony step (see
+  // msUntil() below) — up to ~22s of real waiting on top of everything else.
   it('connects every stage end to end', async () => {
     // 1. Register a buyer and a generator.
     const buyerReg = await request('POST', '/api/organizations', {
@@ -133,11 +147,43 @@ describe('full minimal pipeline: registration -> tender -> matching -> vetting -
     expect(requestRes.status).toBe(200);
     const tenderRequestId = requestRes.body.id;
 
+    // Ceremony scheduling — set relative to real wall-clock time, not the test's own elapsed time:
+    // bidSubmissionDeadline is generous (this test's earlier steps, including tender-creation's
+    // auto-invite emails, can genuinely take several seconds against this environment's SMTP
+    // config), while technicalBidOpenAt/financialBidOpenAt are computed and explicitly waited for
+    // below — see msUntil() — rather than assumed to have already passed by coincidence.
+    const bidSubmissionDeadline = new Date(Date.now() + 20000).toISOString();
+    const technicalBidOpenAt = new Date(Date.now() + 21000).toISOString();
+    const financialBidOpenAt = new Date(Date.now() + 22000).toISOString();
+    // +500ms buffer: the tender's own scheduleCustodianNotification timer (routes/tenders.ts) is
+    // ALSO set to fire at this exact instant and will mint/rotate a token for these same custodians
+    // (see custodianNotificationService.ts's find-or-update). Waiting slightly past the target
+    // rather than landing on it avoids a genuine race between that real scheduled write and this
+    // test's own token issuance right below — this test isn't exercising the scheduler itself, so
+    // letting its side effect settle first (then simply being overwritten by this test's later,
+    // authoritative issuance) is simpler than trying to win a timer race.
+    function msUntil(iso: string): number {
+      return Math.max(0, new Date(iso).getTime() - Date.now()) + 500;
+    }
+
     // A buyer cannot create a tender directly any more — only an admin can.
     const wrongRoleRes = await request(
       'POST',
       '/api/tenders',
-      { title: 'Should fail', requiredCapacityMw: 1, buyerOrgId: buyerReg.body.organizationId, rfsDocumentFeePaise: 100, bidProcessingFeePaise: 100, emdAmountPaise: 100 },
+      {
+        title: 'Should fail',
+        requiredCapacityMw: 1,
+        buyerOrgId: buyerReg.body.organizationId,
+        rfsDocumentFeePaise: 100,
+        bidProcessingFeePaise: 100,
+        emdAmountPaise: 100,
+        bidSubmissionDeadline,
+        technicalBidOpenAt,
+        financialBidOpenAt,
+        useLandedRate: true,
+        equityValue: 1000000,
+        totalUnitsPerYear: 500000,
+      },
       buyerReg.body.token
     );
     expect(wrongRoleRes.status).toBe(403);
@@ -155,6 +201,12 @@ describe('full minimal pipeline: registration -> tender -> matching -> vetting -
         rfsDocumentFeePaise: 100,
         bidProcessingFeePaise: 100,
         emdAmountPaise: 100,
+        bidSubmissionDeadline,
+        technicalBidOpenAt,
+        financialBidOpenAt,
+        useLandedRate: true,
+        equityValue: 1000000,
+        totalUnitsPerYear: 500000,
       },
       adminToken
     );
@@ -179,6 +231,21 @@ describe('full minimal pipeline: registration -> tender -> matching -> vetting -
     const tenderViewRes = await request('GET', `/api/tenders/${tenderId}`, undefined, generatorReg.body.token);
     expect(tenderViewRes.status).toBe(200);
     expect(tenderViewRes.body.invitationStatus).toBe('invited');
+
+    // 3b-i. Pay the RfS Document fee — accepting is now gated on this too (see tenders.ts's
+    // invitations/respond and rfsDocumentAccessService.ts: it applies to an auto-invited generator
+    // exactly the same as an open self-enroll one). Keyed by payerEmail with organizationId: null,
+    // same account-less shape a real purchase leaves behind (see payments.ts).
+    await Payment.create({
+      purpose: 'rfs_document',
+      tenderId,
+      organizationId: null,
+      payerEmail: 'gen@example.com',
+      razorpayOrderId: `order_TEST_rfs_document_${tenderId}`,
+      amountPaise: 100,
+      currency: 'INR',
+      status: 'paid',
+    });
 
     const respondRes = await request(
       'POST',
@@ -259,37 +326,108 @@ describe('full minimal pipeline: registration -> tender -> matching -> vetting -
     expect(submitRes.status).toBe(200);
     const bidId = submitRes.body.id;
 
-    // 5. Admin dashboard: technical ceremony, then decision.
-    const openTechnicalRes = await request('POST', '/api/vetting-bids/open-technical', {
-      tenderRef: String(tenderId),
-      shares: [Buffer.from(technicalKey.shares[0]).toString('base64'), Buffer.from(technicalKey.shares[1]).toString('base64')],
-    });
-    expect(openTechnicalRes.status).toBe(200);
-    expect(JSON.parse(openTechnicalRes.body.opened[0].content)).toEqual({ capacity: '5MW' });
+    // 5. Independent custodian ceremony (routes/vettingCustodian.ts) — two custodians, each with
+    // their own emailed link, submit their share independently. The completing custodian's
+    // "browser" is simulated here using vettingCrypto.ts's own reconstructPrivateKey/openEnvelope —
+    // the exact reference implementation CustodianCeremonyPage.tsx's Web Crypto port mirrors — since
+    // there's no real browser in this test.
+    const custodianA = await VettingCustodian.create({ name: 'Custodian A', email: `custodian-a-${Date.now()}@test.local` });
+    const custodianB = await VettingCustodian.create({ name: 'Custodian B', email: `custodian-b-${Date.now()}@test.local` });
+    createdCustodianIds.push(custodianA.id, custodianB.id);
+
+    // Same find-or-update shape as custodianNotificationService.ts's own token issuance (not a
+    // plain create) — the tender's real scheduleCustodianNotification timer (routes/tenders.ts) is
+    // also live and targets this same custodian/tender/envelope, and given this test's msUntil()
+    // buffer, has deterministically already created its own row by the time this runs. Overwriting
+    // it here (this test's own issuance is authoritative for what it's about to use) is exactly
+    // what a real resend would do too.
+    async function issueCustodianToken(custodianId: number, envelope: 'technical' | 'financial'): Promise<string> {
+      const { token, tokenHash } = generateOpaqueToken();
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+      const existing = await VettingCustodianToken.findOne({ where: { custodianId, tenderId, envelope } });
+      if (existing) {
+        await existing.update({ tokenHash, expiresAt, usedAt: null });
+      } else {
+        await VettingCustodianToken.create({ custodianId, tenderId, envelope, tokenHash, expiresAt });
+      }
+      return token;
+    }
+
+    async function runCustodianCeremony(
+      envelope: 'technical' | 'financial',
+      key: Awaited<ReturnType<typeof generateVettingKeypair>>,
+      shareIndices: [number, number]
+    ) {
+      const tokenA = await issueCustodianToken(custodianA.id, envelope);
+      const tokenB = await issueCustodianToken(custodianB.id, envelope);
+
+      const shareARes = await request('POST', '/api/vetting-custodian/ceremony/share', {
+        share: Buffer.from(key.shares[shareIndices[0]]).toString('base64'),
+      }, tokenA);
+      expect(shareARes.status).toBe(200);
+      expect(shareARes.body.status).toBe('waiting');
+
+      const shareBRes = await request('POST', '/api/vetting-custodian/ceremony/share', {
+        share: Buffer.from(key.shares[shareIndices[1]]).toString('base64'),
+      }, tokenB);
+      expect(shareBRes.status).toBe(200);
+      expect(shareBRes.body.status).toBe('ready');
+      const otherShare: string = shareBRes.body.otherShare;
+
+      const envelopesRes = await request('GET', '/api/vetting-custodian/ceremony/sealed-envelopes', undefined, tokenB);
+      expect(envelopesRes.status).toBe(200);
+
+      const privateKey = await reconstructPrivateKey(
+        [new Uint8Array(Buffer.from(otherShare, 'base64')), key.shares[shareIndices[1]]],
+        key.fingerprint
+      );
+      const opened = envelopesRes.body.envelopes.map((e: { id: number; wrappedDataKey: string; iv: string; ciphertext: string }) => ({
+        bidId: e.id,
+        content: openEnvelope(privateKey, { wrappedDataKey: e.wrappedDataKey, iv: e.iv, ciphertext: e.ciphertext } as SealedEnvelope),
+      }));
+      const shareFingerprints = [
+        crypto.createHash('sha256').update(Buffer.from(otherShare, 'base64')).digest('hex'),
+        crypto.createHash('sha256').update(Buffer.from(key.shares[shareIndices[1]])).digest('hex'),
+      ];
+
+      const completeRes = await request('POST', '/api/vetting-custodian/ceremony/complete', {
+        openedBidIds: opened.map((o: { bidId: number }) => o.bidId),
+        opened,
+        shareFingerprints,
+      }, tokenB);
+      expect(completeRes.status).toBe(200);
+
+      return opened;
+    }
+
+    await new Promise((r) => setTimeout(r, msUntil(technicalBidOpenAt)));
+    const technicalOpened = await runCustodianCeremony('technical', technicalKey, [0, 1]);
+    expect(JSON.parse(technicalOpened[0].content)).toEqual({ capacity: '5MW' });
 
     const decisionRes = await request('POST', `/api/vetting-bids/${bidId}/technical-decision`, {
       decision: 'approved',
-      reviewedContent: JSON.stringify({ capacity: '5MW' }),
-    });
+      reviewedContent: technicalOpened[0].content,
+    }, adminToken);
     expect(decisionRes.status).toBe(200);
 
     // 6. Financial ceremony opens the approved generator's rate bid.
-    const openFinancialRes = await request('POST', '/api/vetting-bids/open-financial', {
-      tenderRef: String(tenderId),
-      shares: [Buffer.from(financialKey.shares[0]).toString('base64'), Buffer.from(financialKey.shares[2]).toString('base64')],
-    });
-    expect(openFinancialRes.status).toBe(200);
-    expect(openFinancialRes.body.opened).toHaveLength(1);
+    await new Promise((r) => setTimeout(r, msUntil(financialBidOpenAt)));
+    const financialOpened = await runCustodianCeremony('financial', financialKey, [0, 2]);
+    expect(financialOpened).toHaveLength(1);
 
     // 7. Promote the tender to an auction — the actual connection point under test. Scheduling is
     // mandatory (auctions never go live at generation time), so this needs a real future
-    // scheduledStartAt.
+    // scheduledStartAt. Admin-only, same as every other step in this dashboard flow.
     const scheduledStartAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
-    const promoteRes = await request('POST', `/api/vetting-bids/${tenderId}/promote-to-auction`, { scheduledStartAt });
+    const promoteRes = await request('POST', `/api/vetting-bids/${tenderId}/promote-to-auction`, { scheduledStartAt }, adminToken);
     expect(promoteRes.status).toBe(200);
     expect(promoteRes.body.links).toHaveLength(1);
     expect(promoteRes.body.links[0].alias).toBe('Test Generator Co');
     expect(promoteRes.body.scheduledStartAt).toBe(scheduledStartAt);
+    // A read-only admin spectator seat is created alongside every promoted auction (see
+    // seedAuctionStandalone's own comment) — the real buyer org getting a seat is a separate,
+    // still-pending decision, not this.
+    expect(promoteRes.body.spectatorLink.alias).toBe('SPECTATOR');
     createdAuctionIds.push(promoteRes.body.auctionId);
 
     const auction = await Auction.findByPk(promoteRes.body.auctionId);
@@ -299,11 +437,15 @@ describe('full minimal pipeline: registration -> tender -> matching -> vetting -
     expect(auction!.tenderRef).toBe(tenderId);
 
     const participants = await AuctionParticipant.findAll({ where: { auctionId: promoteRes.body.auctionId } });
-    expect(participants).toHaveLength(1);
-    expect(participants[0].alias).toBe('Test Generator Co');
+    expect(participants).toHaveLength(2); // the one approved generator + the admin spectator seat
+    const generatorParticipant = participants.find((p) => p.role === 'generator');
+    expect(generatorParticipant!.alias).toBe('Test Generator Co');
+    const spectatorParticipant = participants.find((p) => p.role === 'buyer');
+    expect(spectatorParticipant!.alias).toBe('SPECTATOR');
+    expect(spectatorParticipant!.organizationId).toBeNull();
 
     // Promoting the same tender twice is rejected, not silently duplicated.
-    const secondPromoteRes = await request('POST', `/api/vetting-bids/${tenderId}/promote-to-auction`, { scheduledStartAt });
+    const secondPromoteRes = await request('POST', `/api/vetting-bids/${tenderId}/promote-to-auction`, { scheduledStartAt }, adminToken);
     expect(secondPromoteRes.status).toBe(409);
 
     // 8. EMD is a document now (see EmdSubmission), not money — settling the auction winner is no
@@ -313,5 +455,5 @@ describe('full minimal pipeline: registration -> tender -> matching -> vetting -
     // emdSubmissions.test.ts, not duplicated here.
     const emdBefore = await EmdSubmission.findOne({ where: { tenderId, organizationId: generatorReg.body.organizationId } });
     expect(emdBefore!.status).toBe('submitted');
-  });
+  }, 60000);
 });

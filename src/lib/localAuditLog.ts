@@ -26,6 +26,8 @@ interface LocalAuditRecord {
   participantId: number;
   alias: string;
   amount: string;
+  rate: string;
+  returnPercent: string;
   accepted: boolean;
   rejectReason: string | null;
   ipHash: string | null;

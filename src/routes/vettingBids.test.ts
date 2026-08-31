@@ -13,6 +13,12 @@ import { TenderDocumentField } from '../models/TenderDocumentField.js';
 import { TenderDocumentUpload } from '../models/TenderDocumentUpload.js';
 import { signOrgToken } from '../lib/orgAuth.js';
 
+// Ceremony coverage (custodian share submission, key reconstruction, envelope opening) lives in
+// vettingCustodian.test.ts now — routes/vettingBids.ts no longer runs ceremonies itself (see
+// routes/vettingCustodian.ts). This file covers submission (including the new bidSubmissionDeadline
+// gate), technical-decision, decided-record, the opened-content view, and public-keys — everything
+// that's still actually in vettingBids.ts.
+
 async function cleanupTender(tenderRef: string) {
   const bids = await VettingBid.findAll({ where: { tenderRef } });
   for (const bid of bids) {
@@ -33,7 +39,10 @@ let technicalKey: Awaited<ReturnType<typeof generateVettingKeypair>>;
 let financialKey: Awaited<ReturnType<typeof generateVettingKeypair>>;
 let buyerOrgId: number;
 let generatorOrgId: number;
+let generatorEmail: string;
+let adminOrgId: number;
 let generatorToken: string;
+let adminToken: string;
 
 beforeAll(async () => {
   technicalKey = await generateVettingKeypair();
@@ -43,38 +52,57 @@ beforeAll(async () => {
   process.env.VETTING_FINANCIAL_PUBLIC_KEY_PEM = financialKey.publicKeyPem;
   process.env.VETTING_FINANCIAL_PUBLIC_KEY_FINGERPRINT = financialKey.fingerprint;
 
-  // Imported after env vars are set, since the route module reads them at request time via
-  // getTechnicalKeyConfig()/getFinancialKeyConfig() — safe either way, but keeps intent clear.
   const { default: vettingBidsRouter } = await import('./vettingBids.js');
   app = express();
   app.use(express.json());
   app.use('/api', vettingBidsRouter);
 
-  // Submission is now gated on a real generator org + accepted invitation (see vettingBids.ts) —
-  // one shared buyer/generator pair for the whole file, a fresh Tender+Invitation per test below.
+  // Submission is gated on a real generator org + accepted invitation (see vettingBids.ts) — one
+  // shared buyer/generator/admin trio for the whole file, a fresh Tender+Invitation per test below.
   const buyer = await Organization.create({ type: 'buyer', name: 'Test Buyer Co', contactEmail: `buyer-${Date.now()}@test.local`, contactPhone: '9000000000' });
   const generator = await Organization.create({ type: 'generator', name: 'GEN-A', contactEmail: `gen-${Date.now()}@test.local`, contactPhone: '9000000001' });
+  const admin = await Organization.create({ type: 'admin', name: 'Test Admin', contactEmail: `admin-${Date.now()}@test.local`, contactPhone: '9000000002' });
   buyerOrgId = buyer.id;
   generatorOrgId = generator.id;
+  generatorEmail = generator.contactEmail;
+  adminOrgId = admin.id;
   generatorToken = await signOrgToken({ organizationId: generator.id, type: 'generator' });
+  adminToken = await signOrgToken({ organizationId: admin.id, type: 'admin' });
 });
 
 afterAll(async () => {
-  await Organization.destroy({ where: { id: [buyerOrgId, generatorOrgId] } });
+  await Organization.destroy({ where: { id: [buyerOrgId, generatorOrgId, adminOrgId] } });
 });
 
 // Creates a real Tender + an 'accepted' invitation for the shared test generator, and returns its
-// id (as a string) to use as tenderRef — replaces the old free-string freshTenderRef() now that
-// submission requires tenderRef to reference a real, invited tender. Also pre-satisfies the Bid
-// Processing Fee and EMD gates, since submission (vettingBids.ts) is now gated on both — most tests
-// here are about ceremony/decryption mechanics, not the gates themselves, so satisfying them up
-// front keeps tests focused on what they're actually testing.
+// id (as a string) to use as tenderRef. Also pre-satisfies the RfS Document fee, Bid Processing Fee,
+// and EMD gates, since submission is gated on all three (see vettingBids.ts's missingFees check) —
+// most tests here are about submission/decision mechanics, not the gates themselves, so satisfying
+// them up front keeps tests focused on what they're testing.
+// bidSubmissionDeadline left null (not required at the model level, only at the HTTP creation
+// route) — deadline enforcement gets its own dedicated test below with an explicit deadline set.
 async function makeInvitedTender(): Promise<string> {
   const tender = await Tender.create({ buyerOrgId, title: `Test tender ${Date.now()}-${Math.random().toString(36).slice(2)}`, requiredCapacityMw: '1' });
   await TenderInvitation.create({ tenderId: tender.id, organizationId: generatorOrgId, status: 'accepted' });
+  await payRfsDocumentFee(tender.id);
   await payBidProcessingFee(tender.id);
   await submitEmd(tender.id);
   return String(tender.id);
+}
+
+// organizationId: null + payerEmail, same account-less shape a real RfS Document purchase leaves
+// behind (see rfsDocumentAccessService.ts / payments.ts).
+async function payRfsDocumentFee(tenderId: number): Promise<void> {
+  await Payment.create({
+    purpose: 'rfs_document',
+    tenderId,
+    organizationId: null,
+    payerEmail: generatorEmail,
+    razorpayOrderId: `order_TEST_rfs_document_${tenderId}_${Math.random().toString(36).slice(2)}`,
+    amountPaise: 100,
+    currency: 'INR',
+    status: 'paid',
+  });
 }
 
 async function payBidProcessingFee(tenderId: number): Promise<void> {
@@ -91,7 +119,7 @@ async function payBidProcessingFee(tenderId: number): Promise<void> {
 
 // EMD is a document now (see EmdSubmission), not a Payment — creating the row directly here mirrors
 // what the real emdSubmissions.ts upload route leaves behind, without adding a real S3 dependency
-// to this ceremony-focused test file (emdSubmissions.test.ts covers the actual upload route).
+// to this test file (emdSubmissions.test.ts covers the actual upload route).
 async function submitEmd(tenderId: number): Promise<void> {
   await EmdSubmission.create({
     tenderId,
@@ -137,12 +165,13 @@ async function post(path: string, body: unknown, token?: string) {
   }
 }
 
-async function get(path: string) {
+async function get(path: string, token?: string) {
   const server = app.listen(0);
   try {
     const address = server.address();
     const port = typeof address === 'object' && address ? address.port : 0;
-    const res = await fetch(`http://127.0.0.1:${port}${path}`);
+    const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
+    const res = await fetch(`http://127.0.0.1:${port}${path}`, { headers });
     return { status: res.status, body: await res.json() };
   } finally {
     server.close();
@@ -178,6 +207,22 @@ describe('vettingBids routes', () => {
     expect(res.status).toBe(401);
   });
 
+  it('rejects submission after the tender\'s bidSubmissionDeadline has passed', async () => {
+    const tender = await Tender.create({
+      buyerOrgId,
+      title: `Past deadline ${Date.now()}`,
+      requiredCapacityMw: '1',
+      bidSubmissionDeadline: new Date(Date.now() - 60 * 1000), // one minute ago
+    });
+    tenderRef = String(tender.id);
+    await TenderInvitation.create({ tenderId: tender.id, organizationId: generatorOrgId, status: 'accepted' });
+    await payBidProcessingFee(tender.id);
+    await submitEmd(tender.id);
+
+    const res = await post('/api/vetting-bids', submitBid(tenderRef, '{"capacity":"5MW"}', '{"tariff":6.2}'), generatorToken);
+    expect(res.status).toBe(409);
+  });
+
   it('rejects submission when no accepted invitation exists for this tender', async () => {
     const tender = await Tender.create({ buyerOrgId, title: `No invite ${Date.now()}`, requiredCapacityMw: '1' });
     tenderRef = String(tender.id);
@@ -189,9 +234,10 @@ describe('vettingBids routes', () => {
     const tender = await Tender.create({ buyerOrgId, title: `Unpaid fee ${Date.now()}`, requiredCapacityMw: '1' });
     tenderRef = String(tender.id);
     await TenderInvitation.create({ tenderId: tender.id, organizationId: generatorOrgId, status: 'accepted' });
+    await payRfsDocumentFee(tender.id);
     await submitEmd(tender.id);
-    // Deliberately no payBidProcessingFee() call — invited, accepted, and EMD submitted, but the
-    // fee unpaid.
+    // Deliberately no payBidProcessingFee() call — invited, accepted, RfS fee paid, and EMD
+    // submitted, but the Bid Processing Fee unpaid.
 
     const feeMissing = await post('/api/vetting-bids', submitBid(tenderRef, '{"capacity":"5MW"}', '{"tariff":6.2}'), generatorToken);
     expect(feeMissing.status).toBe(402);
@@ -206,8 +252,9 @@ describe('vettingBids routes', () => {
     const tender = await Tender.create({ buyerOrgId, title: `No EMD ${Date.now()}`, requiredCapacityMw: '1' });
     tenderRef = String(tender.id);
     await TenderInvitation.create({ tenderId: tender.id, organizationId: generatorOrgId, status: 'accepted' });
+    await payRfsDocumentFee(tender.id);
     await payBidProcessingFee(tender.id);
-    // Deliberately no submitEmd() call — fee paid, but no Bank Guarantee on file.
+    // Deliberately no submitEmd() call — both fees paid, but no Bank Guarantee on file.
 
     const emdMissing = await post('/api/vetting-bids', submitBid(tenderRef, '{"capacity":"5MW"}', '{"tariff":6.2}'), generatorToken);
     expect(emdMissing.status).toBe(400);
@@ -221,6 +268,7 @@ describe('vettingBids routes', () => {
     const tender = await Tender.create({ buyerOrgId, title: `Missing docs ${Date.now()}`, requiredCapacityMw: '1' });
     tenderRef = String(tender.id);
     await TenderInvitation.create({ tenderId: tender.id, organizationId: generatorOrgId, status: 'accepted' });
+    await payRfsDocumentFee(tender.id);
     await payBidProcessingFee(tender.id);
     await submitEmd(tender.id);
 
@@ -244,96 +292,91 @@ describe('vettingBids routes', () => {
     expect(bothUploaded.status).toBe(200); // optional Field C never uploaded, and correctly never required
   });
 
-  it('technical ceremony reveals content with any two of three shares, and financial ceremony is rejected before any decision exists', async () => {
-    tenderRef = await makeInvitedTender();
-    await post('/api/vetting-bids', submitBid(tenderRef, '{"capacity":"5MW"}', '{"tariff":6.2}'), generatorToken);
-
-    const openRes = await post('/api/vetting-bids/open-technical', {
-      tenderRef,
-      shares: [Buffer.from(technicalKey.shares[0]).toString('base64'), Buffer.from(technicalKey.shares[2]).toString('base64')],
-    });
-    expect(openRes.status).toBe(200);
-    expect(openRes.body.opened).toHaveLength(1);
-    expect(JSON.parse(openRes.body.opened[0].content)).toEqual({ capacity: '5MW' });
-
-    const financialTooEarly = await post('/api/vetting-bids/open-financial', {
-      tenderRef,
-      shares: [Buffer.from(financialKey.shares[0]).toString('base64'), Buffer.from(financialKey.shares[1]).toString('base64')],
-    });
-    expect(financialTooEarly.status).toBe(409);
-  });
-
-  it('technical ceremony fails cleanly with only one share', async () => {
-    tenderRef = await makeInvitedTender();
-    const res = await post('/api/vetting-bids/open-technical', {
-      tenderRef,
-      shares: [Buffer.from(technicalKey.shares[0]).toString('base64')],
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it('records a technical decision, which is required before the financial ceremony can run', async () => {
+  it('records a technical decision only once a technical ceremony attestation exists, and rejects for an unknown bid', async () => {
     tenderRef = await makeInvitedTender();
     const submitRes = await post('/api/vetting-bids', submitBid(tenderRef, '{"capacity":"5MW"}', '{"tariff":6.2}'), generatorToken);
     const bidId = submitRes.body.id;
 
-    await post('/api/vetting-bids/open-technical', {
-      tenderRef,
-      shares: [Buffer.from(technicalKey.shares[0]).toString('base64'), Buffer.from(technicalKey.shares[1]).toString('base64')],
-    });
-
-    const decisionTooEarly = await post(`/api/vetting-bids/999999999/technical-decision`, {
+    const decisionTooEarly = await post(`/api/vetting-bids/${bidId}/technical-decision`, {
       decision: 'approved',
       reviewedContent: '{"capacity":"5MW"}',
+    }, adminToken);
+    expect(decisionTooEarly.status).toBe(409);
+
+    // Simulates what a completed custodian ceremony leaves behind (routes/vettingCustodian.ts) —
+    // the attestation row itself, without running a real ceremony (covered in
+    // vettingCustodian.test.ts), since technical-decision only ever checks for its existence.
+    await VettingOpeningAttestation.create({
+      tenderRef,
+      envelope: 'technical',
+      openedSetHash: 'test-hash',
+      shareFingerprint1: 'fp1',
+      shareFingerprint2: 'fp2',
     });
-    expect(decisionTooEarly.status).toBe(404);
+
+    const unknownBid = await post(`/api/vetting-bids/999999999/technical-decision`, {
+      decision: 'approved',
+      reviewedContent: '{"capacity":"5MW"}',
+    }, adminToken);
+    expect(unknownBid.status).toBe(404);
 
     const decisionRes = await post(`/api/vetting-bids/${bidId}/technical-decision`, {
       decision: 'approved',
       reviewedContent: '{"capacity":"5MW"}',
-    });
+    }, adminToken);
     expect(decisionRes.status).toBe(200);
     expect(decisionRes.body.technicalStatus).toBe('approved');
 
-    const financialRes = await post('/api/vetting-bids/open-financial', {
-      tenderRef,
-      shares: [Buffer.from(financialKey.shares[1]).toString('base64'), Buffer.from(financialKey.shares[2]).toString('base64')],
-    });
-    expect(financialRes.status).toBe(200);
-    expect(financialRes.body.opened).toHaveLength(1);
-    expect(JSON.parse(financialRes.body.opened[0].content)).toEqual({ tariff: 6.2 });
-
     const records = await VettingDecidedRecord.findAll({ where: { vettingBidId: bidId } });
-    expect(records.map((r) => r.envelope).sort()).toEqual(['financial', 'technical']);
+    expect(records.map((r) => r.envelope)).toEqual(['technical']);
   });
 
-  it('never decrypts a rejected submission\'s financial envelope, even after the financial ceremony runs for others', async () => {
+  it('lists what a custodian ceremony has opened, admin-only', async () => {
     tenderRef = await makeInvitedTender();
-    const rejectedSubmit = await post('/api/vetting-bids', submitBid(tenderRef, '{"capacity":"1MW"}', '{"tariff":9.9}'), generatorToken);
-    const approvedSubmit = await post('/api/vetting-bids', submitBid(tenderRef, '{"capacity":"5MW"}', '{"tariff":6.2}'), generatorToken);
+    const submitRes = await post('/api/vetting-bids', submitBid(tenderRef, '{"capacity":"5MW"}', '{"tariff":6.2}'), generatorToken);
+    const bidId = submitRes.body.id;
 
-    await post('/api/vetting-bids/open-technical', {
-      tenderRef,
-      shares: [Buffer.from(technicalKey.shares[0]).toString('base64'), Buffer.from(technicalKey.shares[1]).toString('base64')],
-    });
-    await post(`/api/vetting-bids/${rejectedSubmit.body.id}/technical-decision`, { decision: 'rejected', reviewedContent: '{"capacity":"1MW"}' });
-    await post(`/api/vetting-bids/${approvedSubmit.body.id}/technical-decision`, { decision: 'approved', reviewedContent: '{"capacity":"5MW"}' });
+    const beforeOpen = await get(`/api/vetting-bids/${tenderRef}/opened/technical`, adminToken);
+    expect(beforeOpen.status).toBe(200);
+    expect(beforeOpen.body.opened).toEqual([]);
 
-    const financialRes = await post('/api/vetting-bids/open-financial', {
-      tenderRef,
-      shares: [Buffer.from(financialKey.shares[0]).toString('base64'), Buffer.from(financialKey.shares[2]).toString('base64')],
-    });
-    expect(financialRes.status).toBe(200);
-    const openedIds = financialRes.body.opened.map((o: { id: number }) => o.id);
-    expect(openedIds).toContain(approvedSubmit.body.id);
-    expect(openedIds).not.toContain(rejectedSubmit.body.id);
+    // Simulates what routes/vettingCustodian.ts's POST /ceremony/complete leaves behind.
+    const bid = await VettingBid.findByPk(bidId);
+    const { encryptField } = await import('../lib/fieldEncryption.js');
+    await bid!.update({ technicalOpenedContent: await encryptField('{"capacity":"5MW"}') });
 
-    const rejectedRecords = await VettingDecidedRecord.findAll({ where: { vettingBidId: rejectedSubmit.body.id, envelope: 'financial' } });
-    expect(rejectedRecords).toHaveLength(0);
+    const afterOpen = await get(`/api/vetting-bids/${tenderRef}/opened/technical`, adminToken);
+    expect(afterOpen.status).toBe(200);
+    expect(afterOpen.body.opened).toHaveLength(1);
+    expect(afterOpen.body.opened[0].content).toBe('{"capacity":"5MW"}');
+
+    const asGenerator = await get(`/api/vetting-bids/${tenderRef}/opened/technical`, generatorToken);
+    expect(asGenerator.status).toBe(403);
   });
 
-  it('exposes both public keys and fingerprints', async () => {
-    const res = await get('/api/vetting-bids/public-keys');
+  it('lists hasOpenedTechnicalContent/hasOpenedFinancialContent per bid', async () => {
+    tenderRef = await makeInvitedTender();
+    const submitRes = await post('/api/vetting-bids', submitBid(tenderRef, '{"capacity":"5MW"}', '{"tariff":6.2}'), generatorToken);
+
+    const beforeOpen = await get(`/api/vetting-bids?tenderRef=${tenderRef}`, adminToken);
+    expect(beforeOpen.status).toBe(200);
+    expect(beforeOpen.body.bids[0].hasOpenedTechnicalContent).toBe(false);
+    expect(beforeOpen.body.bids[0].hasOpenedFinancialContent).toBe(false);
+
+    const bid = await VettingBid.findByPk(submitRes.body.id);
+    const { encryptField } = await import('../lib/fieldEncryption.js');
+    await bid!.update({ technicalOpenedContent: await encryptField('{"capacity":"5MW"}') });
+
+    const afterOpen = await get(`/api/vetting-bids?tenderRef=${tenderRef}`, adminToken);
+    expect(afterOpen.body.bids[0].hasOpenedTechnicalContent).toBe(true);
+    expect(afterOpen.body.bids[0].hasOpenedFinancialContent).toBe(false);
+  });
+
+  it('exposes both public keys and fingerprints to any authenticated org', async () => {
+    const anonymous = await get('/api/vetting-bids/public-keys');
+    expect(anonymous.status).toBe(401);
+
+    const res = await get('/api/vetting-bids/public-keys', generatorToken);
     expect(res.status).toBe(200);
     expect(res.body.technical.fingerprint).toBe(technicalKey.fingerprint);
     expect(res.body.financial.fingerprint).toBe(financialKey.fingerprint);

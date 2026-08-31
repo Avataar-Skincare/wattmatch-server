@@ -75,6 +75,14 @@ async function get(path: string, token?: string) {
 }
 
 const pricing = { rfsDocumentFeePaise: 500, bidProcessingFeePaise: 1000, emdAmountPaise: 200000 };
+const ceremonyDates = {
+  bidSubmissionDeadline: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+  technicalBidOpenAt: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
+  financialBidOpenAt: new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString(),
+  useLandedRate: true,
+  equityValue: 1000000,
+  totalUnitsPerYear: 500000,
+};
 
 describe('tender requests + admin-only tender creation', () => {
   it('a buyer can submit a request, and see it in their own list', async () => {
@@ -110,7 +118,7 @@ describe('tender requests + admin-only tender creation', () => {
     const reqRes = await post('/api/tender-requests', { title: 'Convert Me', requiredCapacityMw: 8 }, buyerToken);
     const tenderRequestId = reqRes.body.id;
 
-    const tenderRes = await post('/api/tenders', { title: 'Convert Me — final', requiredCapacityMw: 8, tenderRequestId, ...pricing }, adminToken);
+    const tenderRes = await post('/api/tenders', { title: 'Convert Me — final', requiredCapacityMw: 8, tenderRequestId, ...pricing, ...ceremonyDates }, adminToken);
     expect(tenderRes.status).toBe(200);
     createdTenderIds.push(tenderRes.body.tenderId);
 
@@ -129,27 +137,27 @@ describe('tender requests + admin-only tender creation', () => {
     const reqRes = await post('/api/tender-requests', { title: 'Convert Once', requiredCapacityMw: 3 }, buyerToken);
     const tenderRequestId = reqRes.body.id;
 
-    const first = await post('/api/tenders', { title: 'First conversion', requiredCapacityMw: 3, tenderRequestId, ...pricing }, adminToken);
+    const first = await post('/api/tenders', { title: 'First conversion', requiredCapacityMw: 3, tenderRequestId, ...pricing, ...ceremonyDates }, adminToken);
     expect(first.status).toBe(200);
     createdTenderIds.push(first.body.tenderId);
 
-    const second = await post('/api/tenders', { title: 'Second conversion', requiredCapacityMw: 3, tenderRequestId, ...pricing }, adminToken);
+    const second = await post('/api/tenders', { title: 'Second conversion', requiredCapacityMw: 3, tenderRequestId, ...pricing, ...ceremonyDates }, adminToken);
     expect(second.status).toBe(409);
   });
 
   it('admin can create an ad-hoc tender with an explicit buyerOrgId, with no request involved', async () => {
-    const res = await post('/api/tenders', { title: 'Ad hoc tender', requiredCapacityMw: 4, buyerOrgId, ...pricing }, adminToken);
+    const res = await post('/api/tenders', { title: 'Ad hoc tender', requiredCapacityMw: 4, buyerOrgId, ...pricing, ...ceremonyDates }, adminToken);
     expect(res.status).toBe(200);
     createdTenderIds.push(res.body.tenderId);
   });
 
   it('rejects a buyerOrgId that does not refer to a real buyer', async () => {
-    const res = await post('/api/tenders', { title: 'Bad buyer', requiredCapacityMw: 4, buyerOrgId: 999999999, ...pricing }, adminToken);
+    const res = await post('/api/tenders', { title: 'Bad buyer', requiredCapacityMw: 4, buyerOrgId: 999999999, ...pricing, ...ceremonyDates }, adminToken);
     expect(res.status).toBe(400);
   });
 
   it('a buyer token can no longer create a tender directly', async () => {
-    const res = await post('/api/tenders', { title: 'Should fail', requiredCapacityMw: 4, buyerOrgId, ...pricing }, buyerToken);
+    const res = await post('/api/tenders', { title: 'Should fail', requiredCapacityMw: 4, buyerOrgId, ...pricing, ...ceremonyDates }, buyerToken);
     expect(res.status).toBe(403);
   });
 

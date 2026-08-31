@@ -13,6 +13,8 @@ export class AuctionBidAudit extends Model<InferAttributes<AuctionBidAudit>, Inf
   declare participantId: number;
   declare alias: string;
   declare amount: string;
+  declare rate: string | null;
+  declare returnPercent: string | null;
   declare accepted: boolean;
   declare rejectReason: string | null;
   declare ipHash: string | null;
@@ -31,6 +33,8 @@ AuctionBidAudit.init(
     participantId: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false },
     alias: { type: DataTypes.STRING, allowNull: false },
     amount: { type: DataTypes.DECIMAL(10, 4), allowNull: false },
+    rate: { type: DataTypes.DECIMAL(10, 4), allowNull: true },
+    returnPercent: { type: DataTypes.DECIMAL(5, 2), allowNull: true },
     accepted: { type: DataTypes.BOOLEAN, allowNull: false },
     rejectReason: { type: DataTypes.STRING, allowNull: true },
     ipHash: { type: DataTypes.STRING, allowNull: true },

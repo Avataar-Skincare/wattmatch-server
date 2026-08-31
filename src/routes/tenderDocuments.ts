@@ -1,5 +1,5 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
-import rateLimit from 'express-rate-limit';
+import { jsonRateLimit as rateLimit } from '../lib/rateLimit.js';
 import multer from 'multer';
 import { z } from 'zod';
 import { Tender } from '../models/Tender.js';
@@ -7,8 +7,8 @@ import { TenderInvitation } from '../models/TenderInvitation.js';
 import { TenderDocumentField, type DocumentEnvelope } from '../models/TenderDocumentField.js';
 import { TenderDocumentUpload } from '../models/TenderDocumentUpload.js';
 import { VettingOpeningAttestation } from '../models/VettingOpeningAttestation.js';
-import { verifyOrgToken, type OrgTokenPayload } from '../lib/orgAuth.js';
 import { uploadObject, getSignedDownloadUrl } from '../lib/s3.js';
+import { authRequired } from '../middleware/auth.js';
 import { logger } from '../lib/logger.js';
 
 const router = Router();
@@ -57,20 +57,6 @@ const addFieldBodySchema = z.object({
   required: stringBoolean.optional().default(true),
 });
 
-function extractBearerToken(authHeader: string | undefined): string | undefined {
-  return authHeader?.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : undefined;
-}
-
-async function requireOrgAuth(authHeader: string | undefined): Promise<OrgTokenPayload | null> {
-  const token = extractBearerToken(authHeader);
-  if (!token) return null;
-  try {
-    return await verifyOrgToken(token);
-  } catch {
-    return null;
-  }
-}
-
 function s3KeyForTemplate(tenderId: number, fieldId: number, filename: string): string {
   return `tender-documents/${tenderId}/templates/${fieldId}-${Date.now()}-${filename}`;
 }
@@ -86,29 +72,26 @@ function s3KeyForUpload(tenderId: number, fieldId: number, organizationId: numbe
 // generator to see what they'll eventually need before formally accepting.
 async function requireTenderVisibility(
   tenderId: number,
-  payload: OrgTokenPayload
+  org: NonNullable<Request['org']>
 ): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
   const tender = await Tender.findByPk(tenderId);
   if (!tender) return { ok: false, status: 404, error: 'Tender not found' };
 
-  if (payload.type === 'admin') return { ok: true };
+  if (org.type === 'admin') return { ok: true };
 
-  const invitation = await TenderInvitation.findOne({ where: { tenderId, organizationId: payload.organizationId } });
+  const invitation = await TenderInvitation.findOne({ where: { tenderId, organizationId: org.id } });
   if (!invitation) return { ok: false, status: 403, error: 'This tender is not visible until you are invited' };
   return { ok: true };
 }
 
 // Lists the field registry for both envelopes, with a per-field template download link if one
 // exists.
-router.get('/tenders/:id/document-fields', readLimiter, async (req, res, next) => {
+router.get('/tenders/:id/document-fields', readLimiter, ...authRequired(), async (req, res, next) => {
   try {
     const tenderId = Number(req.params.id);
     if (!Number.isFinite(tenderId)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
 
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-
-    const visibility = await requireTenderVisibility(tenderId, payload);
+    const visibility = await requireTenderVisibility(tenderId, req.org!);
     if (!visibility.ok) return res.status(visibility.status).json({ success: false, error: visibility.error });
 
     const fields = await TenderDocumentField.findAll({ where: { tenderId }, order: [['sortOrder', 'ASC']] });
@@ -135,19 +118,13 @@ router.get('/tenders/:id/document-fields', readLimiter, async (req, res, next) =
 // Admin-only: add a custom field on top of the default checklist (Stage 6.3) — buyers have no
 // operational role in running a tender once they've requested it. Always multipart so an optional
 // blank-template PDF can ride along with the same request as the text fields.
-router.post('/tenders/:id/document-fields', writeLimiter, upload.single('template'), async (req, res, next) => {
+router.post('/tenders/:id/document-fields', writeLimiter, ...authRequired('admin'), upload.single('template'), async (req, res, next) => {
   try {
     const tenderId = Number(req.params.id);
     if (!Number.isFinite(tenderId)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
 
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-
     const tender = await Tender.findByPk(tenderId);
     if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
-    if (payload.type !== 'admin') {
-      return res.status(403).json({ success: false, error: 'Only admin organizations can configure this tender\'s document fields' });
-    }
 
     const parsed = addFieldBodySchema.safeParse(req.body);
     if (!parsed.success) {
@@ -193,7 +170,7 @@ const updateFieldBodySchema = z.object({ required: stringBoolean });
 // Admin-only: flip a field's required/optional flag without deleting and re-adding it (Stage 6.3)
 // — re-adding via POST loses any uploads already made against the old row (DELETE cascades them),
 // which a pure required/optional toggle has no reason to throw away.
-router.patch('/tenders/:id/document-fields/:fieldId', writeLimiter, async (req, res, next) => {
+router.patch('/tenders/:id/document-fields/:fieldId', writeLimiter, ...authRequired('admin'), async (req, res, next) => {
   try {
     const tenderId = Number(req.params.id);
     const fieldId = Number(req.params.fieldId);
@@ -201,14 +178,8 @@ router.patch('/tenders/:id/document-fields/:fieldId', writeLimiter, async (req, 
       return res.status(400).json({ success: false, error: 'Invalid tender or field id' });
     }
 
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-
     const tender = await Tender.findByPk(tenderId);
     if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
-    if (payload.type !== 'admin') {
-      return res.status(403).json({ success: false, error: 'Only admin organizations can configure this tender\'s document fields' });
-    }
 
     const parsed = updateFieldBodySchema.safeParse(req.body);
     if (!parsed.success) {
@@ -233,7 +204,7 @@ router.patch('/tenders/:id/document-fields/:fieldId', writeLimiter, async (req, 
 // field itself (which would cascade away any bidder uploads already made against it, per the DELETE
 // route below). Separate from the template optionally attached on POST /document-fields, which only
 // covers the moment a field is first created — this is the "replace it later" path.
-router.post('/tenders/:id/document-fields/:fieldId/template', writeLimiter, upload.single('template'), async (req, res, next) => {
+router.post('/tenders/:id/document-fields/:fieldId/template', writeLimiter, ...authRequired('admin'), upload.single('template'), async (req, res, next) => {
   try {
     const tenderId = Number(req.params.id);
     const fieldId = Number(req.params.fieldId);
@@ -241,14 +212,8 @@ router.post('/tenders/:id/document-fields/:fieldId/template', writeLimiter, uplo
       return res.status(400).json({ success: false, error: 'Invalid tender or field id' });
     }
 
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-
     const tender = await Tender.findByPk(tenderId);
     if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
-    if (payload.type !== 'admin') {
-      return res.status(403).json({ success: false, error: 'Only admin organizations can configure this tender\'s document fields' });
-    }
 
     if (!req.file) return res.status(400).json({ success: false, error: 'A PDF template file is required' });
 
@@ -272,7 +237,7 @@ router.post('/tenders/:id/document-fields/:fieldId/template', writeLimiter, uplo
 
 // Admin-only: remove a field (Stage 6.3). Cascades to any uploads already made against it — once
 // the requirement is gone, keeping orphaned files around serves no one.
-router.delete('/tenders/:id/document-fields/:fieldId', writeLimiter, async (req, res, next) => {
+router.delete('/tenders/:id/document-fields/:fieldId', writeLimiter, ...authRequired('admin'), async (req, res, next) => {
   try {
     const tenderId = Number(req.params.id);
     const fieldId = Number(req.params.fieldId);
@@ -280,14 +245,8 @@ router.delete('/tenders/:id/document-fields/:fieldId', writeLimiter, async (req,
       return res.status(400).json({ success: false, error: 'Invalid tender or field id' });
     }
 
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-
     const tender = await Tender.findByPk(tenderId);
     if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
-    if (payload.type !== 'admin') {
-      return res.status(403).json({ success: false, error: 'Only admin organizations can configure this tender\'s document fields' });
-    }
 
     const field = await TenderDocumentField.findOne({ where: { id: fieldId, tenderId } });
     if (!field) return res.status(404).json({ success: false, error: 'Field not found for this tender' });
@@ -306,7 +265,7 @@ router.delete('/tenders/:id/document-fields/:fieldId', writeLimiter, async (req,
 // Generator uploads their filled PDF for one field. Gated on 'accepted' invitation status — the
 // same bar as actual bid submission (vettingBids.ts), since these documents are part of assembling
 // that same submission, not a separate, looser-gated action.
-router.post('/tenders/:id/document-fields/:fieldId/upload', writeLimiter, upload.single('file'), async (req, res, next) => {
+router.post('/tenders/:id/document-fields/:fieldId/upload', writeLimiter, ...authRequired('generator'), upload.single('file'), async (req, res, next) => {
   try {
     const tenderId = Number(req.params.id);
     const fieldId = Number(req.params.fieldId);
@@ -314,14 +273,8 @@ router.post('/tenders/:id/document-fields/:fieldId/upload', writeLimiter, upload
       return res.status(400).json({ success: false, error: 'Invalid tender or field id' });
     }
 
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-    if (payload.type !== 'generator') {
-      return res.status(403).json({ success: false, error: 'Only generator organizations upload bid documents' });
-    }
-
     const invitation = await TenderInvitation.findOne({
-      where: { tenderId, organizationId: payload.organizationId, status: 'accepted' },
+      where: { tenderId, organizationId: req.org!.id, status: 'accepted' },
     });
     if (!invitation) {
       return res.status(403).json({ success: false, error: 'You must accept this tender\'s invitation before uploading documents' });
@@ -332,12 +285,12 @@ router.post('/tenders/:id/document-fields/:fieldId/upload', writeLimiter, upload
 
     if (!req.file) return res.status(400).json({ success: false, error: 'A PDF file is required' });
 
-    const s3Key = s3KeyForUpload(tenderId, fieldId, payload.organizationId, req.file.originalname);
+    const s3Key = s3KeyForUpload(tenderId, fieldId, req.org!.id, req.file.originalname);
     await uploadObject(s3Key, req.file.buffer, 'application/pdf');
 
     const [uploadRow] = await TenderDocumentUpload.upsert({
       tenderId,
-      organizationId: payload.organizationId,
+      organizationId: req.org!.id,
       fieldId,
       s3Key,
       originalFilename: req.file.originalname,
@@ -345,7 +298,7 @@ router.post('/tenders/:id/document-fields/:fieldId/upload', writeLimiter, upload
     });
 
     logger.info(
-      { reqId: req.requestId, tenderId, fieldId, organizationId: payload.organizationId, uploadId: uploadRow.id },
+      { reqId: req.requestId, tenderId, fieldId, organizationId: req.org!.id, uploadId: uploadRow.id },
       '[TENDER_DOCS] document uploaded'
     );
 
@@ -383,18 +336,12 @@ async function buildDocumentStatus(tenderId: number, organizationId: number) {
 
 // A generator's own upload status across every field — enough for the bid-submission page to show
 // a checklist with what's still missing before they attempt to submit.
-router.get('/tenders/:id/documents/mine', readLimiter, async (req, res, next) => {
+router.get('/tenders/:id/documents/mine', readLimiter, ...authRequired('generator'), async (req, res, next) => {
   try {
     const tenderId = Number(req.params.id);
     if (!Number.isFinite(tenderId)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
 
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-    if (payload.type !== 'generator') {
-      return res.status(403).json({ success: false, error: 'Only generator organizations have this view' });
-    }
-
-    const documents = await buildDocumentStatus(tenderId, payload.organizationId);
+    const documents = await buildDocumentStatus(tenderId, req.org!.id);
     res.json({ success: true, documents });
   } catch (err) {
     next(err);
@@ -406,7 +353,7 @@ router.get('/tenders/:id/documents/mine', readLimiter, async (req, res, next) =>
 // eligibility docs, board resolutions, etc.) are themselves part of what gets evaluated as the
 // technical bid, so they carry the same "not even admin can see it early" guarantee the sealed-bid
 // ciphertext already gets, not just an ordinary access-control check.
-router.get('/tenders/:id/documents/:organizationId', readLimiter, async (req, res, next) => {
+router.get('/tenders/:id/documents/:organizationId', readLimiter, ...authRequired('admin'), async (req, res, next) => {
   try {
     const tenderId = Number(req.params.id);
     const organizationId = Number(req.params.organizationId);
@@ -414,14 +361,8 @@ router.get('/tenders/:id/documents/:organizationId', readLimiter, async (req, re
       return res.status(400).json({ success: false, error: 'Invalid tender or organization id' });
     }
 
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-
     const tender = await Tender.findByPk(tenderId);
     if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
-    if (payload.type !== 'admin') {
-      return res.status(403).json({ success: false, error: 'Only admin organizations can review this tender\'s documents' });
-    }
 
     const technicalOpening = await VettingOpeningAttestation.findOne({
       where: { tenderRef: String(tenderId), envelope: 'technical' },

@@ -8,7 +8,13 @@ export class AuctionBid extends Model<InferAttributes<AuctionBid>, InferCreation
   declare auctionId: number;
   declare participantId: number;
   declare alias: string;
+  // Landed rate — the value actually compared to decide the leader (see auctionEngine.ts's
+  // computeLandedRate). Column name kept as `amount` rather than renamed to avoid a large-diff
+  // sweep across sockets/frontend/tests/export for what's still a PoC-stage feature; `rate` and
+  // `returnPercent` below hold the raw inputs it was derived from.
   declare amount: string;
+  declare rate: string | null;
+  declare returnPercent: string | null;
   declare accepted: boolean;
   declare rejectReason: string | null;
   declare ipHash: string | null;
@@ -31,6 +37,8 @@ AuctionBid.init(
     participantId: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false },
     alias: { type: DataTypes.STRING, allowNull: false },
     amount: { type: DataTypes.DECIMAL(10, 4), allowNull: false },
+    rate: { type: DataTypes.DECIMAL(10, 4), allowNull: true },
+    returnPercent: { type: DataTypes.DECIMAL(5, 2), allowNull: true },
     accepted: { type: DataTypes.BOOLEAN, allowNull: false },
     rejectReason: { type: DataTypes.STRING, allowNull: true },
     ipHash: { type: DataTypes.STRING, allowNull: true },

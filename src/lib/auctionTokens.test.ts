@@ -31,28 +31,26 @@ describe('signJoinToken / verifyJoinToken', () => {
     await expect(verifyJoinToken('not-a-real-token')).rejects.toThrow();
   });
 
-  // Regression test for a real dead end: a buyer/winner revealing identity post-close (see
-  // auctionAdmin.ts's /winner-identity) could be doing so well after the 24h live-window expiry,
-  // with no way to get a fresh token — verifyJoinToken's ignoreExpiration option exists so that
-  // route isn't permanently locked out, while the default (used by the live socket path) stays
-  // strict.
-  it('rejects an expired token by default, but accepts it with ignoreExpiration', async () => {
+  it('rejects an expired token', async () => {
     vi.useFakeTimers();
     try {
       const token = await signJoinToken({ auctionId: 1, participantId: 2, alias: 'GEN-A', jti: generateJti() });
-      vi.advanceTimersByTime(25 * 60 * 60 * 1000); // 25h — past the 24h expiry
+      vi.advanceTimersByTime(25 * 60 * 60 * 1000); // 25h — past the default 24h expiry
       await expect(verifyJoinToken(token)).rejects.toThrow();
-      const decoded = await verifyJoinToken(token, { ignoreExpiration: true });
-      expect(decoded.alias).toBe('GEN-A');
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('still rejects a tampered token even with ignoreExpiration — expiry relief is not a signature bypass', async () => {
-    const token = await signJoinToken({ auctionId: 1, participantId: 2, alias: 'GEN-A', jti: generateJti() });
-    const tampered = token.slice(0, -4) + 'XXXX';
-    await expect(verifyJoinToken(tampered, { ignoreExpiration: true })).rejects.toThrow();
+  it('honors an explicit shorter expiresIn', async () => {
+    vi.useFakeTimers();
+    try {
+      const token = await signJoinToken({ auctionId: 1, participantId: 2, alias: 'GEN-A', jti: generateJti() }, '1h');
+      vi.advanceTimersByTime(90 * 60 * 1000); // 90min — past the 1h expiry
+      await expect(verifyJoinToken(token)).rejects.toThrow();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

@@ -3,6 +3,7 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
 import { sequelize } from './db/sequelize.js';
 import { auditSequelize } from './db/auditSequelize.js';
 import { redis } from './lib/redis.js';
@@ -14,8 +15,10 @@ import adminRouter from './routes/admin.js';
 // commented out (routes/otp.ts) in case it's reintroduced later.
 // import otpRouter from './routes/otp.js';
 import registrationsRouter from './routes/registrations.js';
+import auctionsRouter from './routes/auctions.js';
 import auctionAdminRouter from './routes/auctionAdmin.js';
 import vettingBidsRouter from './routes/vettingBids.js';
+import vettingCustodianRouter from './routes/vettingCustodian.js';
 import vettingAuctionBridgeRouter from './routes/vettingAuctionBridge.js';
 import organizationsRouter from './routes/organizations.js';
 import tendersRouter from './routes/tenders.js';
@@ -24,10 +27,25 @@ import emdSubmissionsRouter from './routes/emdSubmissions.js';
 import paymentsRouter from './routes/payments.js';
 import devLocalStorageRouter from './routes/devLocalStorage.js';
 import { setupAuctionSocket } from './sockets/auctionSocket.js';
+import { startScheduledAuctionActivationLoop } from './services/auctionEngine.js';
+import { startCustodianNotificationCheckLoop } from './services/custodianNotificationService.js';
+import { startPaymentReconciliationLoop } from './services/paymentReconciliationService.js';
+import { startInvoiceGenerationCheckLoop } from './services/invoiceService.js';
 
 const app = express();
 const port = process.env.PORT ?? 4000;
 
+// TRUST_PROXY_HOPS: the number of reverse-proxy hops in front of this process (e.g. an ALB/
+// CloudFront in front of the app = 1). Every route's express-rate-limit instance keys on req.ip,
+// which without this reads as the proxy's own IP for every request once deployed behind one —
+// bucketing every real caller together and effectively disabling those limits. Left unset (today's
+// behavior) outside a real deployment; set explicitly once the real hop count is known — guessing
+// wrong would let a caller spoof X-Forwarded-For to dodge the limit, which is worse than leaving it
+// unset until the real count is confirmed.
+const trustProxyHops = process.env.TRUST_PROXY_HOPS ? Number(process.env.TRUST_PROXY_HOPS) : undefined;
+if (trustProxyHops !== undefined) app.set('trust proxy', trustProxyHops);
+
+app.use(helmet());
 app.use(cors({ origin: process.env.CORS_ORIGIN ?? 'http://localhost:5173' }));
 // `verify` captures the exact raw bytes into req.rawBody alongside normal JSON parsing — needed by
 // the Razorpay webhook route's HMAC check, which must sign the literal bytes Razorpay sent, not a
@@ -79,21 +97,28 @@ app.use('/api/contact', contactRouter);
 app.use('/api/admin', adminRouter);
 // app.use('/api/otp', otpRouter);
 app.use('/api/registrations', registrationsRouter);
-// PoC-only: reverse-auction MVP, see AUCTION_MVP_PLAN.md. No auth on the seed route by design —
-// stands in for the real enrollment flow, not meant to ship as-is.
+// Participant-facing auction routes (join, winner-identity) — org-login-gated, see routes/auctions.ts.
+app.use('/api', auctionsRouter);
+// PoC-only: reverse-auction MVP, see AUCTION_MVP_PLAN.md. Manual seed/export routes are admin-only
+// (middleware/auth.ts) — kept as an admin manual-override tool alongside the real vetting-to-
+// auction promotion path (vettingAuctionBridge.ts), not meant to be the primary flow.
 app.use('/api/auction-admin', auctionAdminRouter);
 // Sealed technical + financial bid module (pre-auction stage) — see
-// VETTING_BID_SEALING_IMPLEMENTATION_PLAN.md. No auth yet, same as the routes above; the one
-// route holding settled bid content (/decided-record) is specifically planned for email+password
-// login before any real data flows through it — see AUTH_STRATEGY_DECISIONS.md.
+// VETTING_BID_SEALING_IMPLEMENTATION_PLAN.md. Decision/list/decided-record/opened routes are
+// admin-only; submission and public-keys require any real org token — see middleware/auth.ts.
 app.use('/api', vettingBidsRouter);
-// Vetting -> live auction bridge — see VETTING_TO_AUCTION_BRIDGE_PLAN.md. Deliberately does not
-// share code with auctionAdmin.ts's seed route (see that route's own comment) to avoid touching
-// tested, demo-critical code.
+// Custodian ceremony — a custodian's own emailed per-(tender, envelope) link, not an admin login.
+// See middleware/custodianAuth.ts and routes/vettingCustodian.ts's own comment for why this is
+// deliberately separate from every other route in this codebase.
+app.use('/api', vettingCustodianRouter);
+// Vetting -> live auction bridge — see VETTING_TO_AUCTION_BRIDGE_PLAN.md. Admin-only. Deliberately
+// does not share code with auctionAdmin.ts's seed route (see that route's own comment) to avoid
+// touching tested, demo-critical code.
 app.use('/api', vettingAuctionBridgeRouter);
-// Minimal buyer/generator registration + tender posting/matching — see
-// MINIMAL_PIPELINE_INTEGRATION_PLAN.md. Placeholder auth (orgAuth.ts), not the real
-// email+password login decided in AUTH_STRATEGY_DECISIONS.md.
+// Buyer/generator/admin registration + tender posting/matching — see
+// MINIMAL_PIPELINE_INTEGRATION_PLAN.md. orgAuth.ts's org-session JWT (email+password login via
+// passwordAuth.ts) is the real, only auth mechanism gating every non-public route in this
+// codebase — see middleware/auth.ts.
 app.use('/api', organizationsRouter);
 app.use('/api', tendersRouter);
 // Stage 6.1/6.2/6.3's document checklist — see TENDER_WORKFLOW_STAKEHOLDER_PLAN.md.
@@ -133,6 +158,12 @@ async function start() {
   }
   const httpServer = http.createServer(app);
   setupAuctionSocket(httpServer);
+  // Self-healing recovery loops for in-process schedulers that would otherwise silently lose their
+  // work on a restart — see each function's own comment for exactly what gap it closes.
+  startScheduledAuctionActivationLoop();
+  startCustodianNotificationCheckLoop();
+  startPaymentReconciliationLoop();
+  startInvoiceGenerationCheckLoop();
   httpServer.listen(port, () => logger.info({ port }, 'Wattmatch server listening'));
 }
 

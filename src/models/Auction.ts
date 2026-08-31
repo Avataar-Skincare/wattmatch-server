@@ -40,6 +40,25 @@ export class Auction extends Model<InferAttributes<Auction>, InferCreationAttrib
   // of today's demo auctions. Used for traceability and to guard against promoting the same
   // tender to a live auction twice.
   declare tenderRef: CreationOptional<number | null>;
+  // Landed-rate formula inputs (see auctionEngine.ts's computeLandedRate) — copied in at seed time
+  // from the promoting Tender's own equityValue/totalUnitsPerYear, or supplied directly by an
+  // admin seeding a standalone demo auction (auctionAdmin.ts) — same "copy onto Auction, don't
+  // live-read Tender" pattern already used for openingBid/windowSeconds/maxAutoExtensions. Nullable
+  // only for auctions seeded before this existed.
+  declare equityValue: string | null;
+  declare totalUnitsPerYear: string | null;
+  // Per-auction switch, copied from the promoting Tender's own useLandedRate (or supplied directly
+  // for a standalone demo seed) — decides whether submitBid computes a landed rate at all (see
+  // auctionEngine.ts). Defaults false so an auction seeded before this existed behaves exactly as
+  // it always did.
+  declare useLandedRate: CreationOptional<boolean>;
+  // Set only for auctions created via the vetting->auction bridge's scheduled promotion
+  // (vettingAuctionBridge.ts) — null for every manually-seeded (auctionAdmin.ts) auction, which goes
+  // live immediately with no scheduling involved. Exists so a self-healing check
+  // (auctionEngine.ts's startScheduledAuctionActivationLoop) can find and activate any auction whose
+  // in-process start timer was lost to a server restart between promotion and its start time,
+  // instead of relying solely on that one-shot in-memory timer.
+  declare scheduledStartAt: Date | null;
   declare readonly createdAt: CreationOptional<Date>;
   declare readonly updatedAt: CreationOptional<Date>;
 }
@@ -62,6 +81,10 @@ Auction.init(
     resultSummaryJson: { type: DataTypes.TEXT, allowNull: true },
     resultHash: { type: DataTypes.STRING, allowNull: true },
     tenderRef: { type: DataTypes.INTEGER.UNSIGNED, allowNull: true },
+    equityValue: { type: DataTypes.DECIMAL(14, 2), allowNull: true },
+    totalUnitsPerYear: { type: DataTypes.DECIMAL(14, 2), allowNull: true },
+    useLandedRate: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    scheduledStartAt: { type: DataTypes.DATE, allowNull: true },
     createdAt: DataTypes.DATE,
     updatedAt: DataTypes.DATE,
   },

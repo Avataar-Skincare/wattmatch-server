@@ -46,3 +46,25 @@ export async function reconcileStalePayments(): Promise<ReconciliationResult> {
   logger.info({ checked: stale.length, updatedCount: updated.length }, '[RECONCILE] run complete');
   return { checked: stale.length, updated };
 }
+
+// Runs every 10 minutes so a payment that never gets a /verify call or a webhook doesn't just sit
+// in 'created' forever with nobody aware — this used to be reachable only via the admin-only
+// POST /payment/reconcile route, meaning it never ran unless an admin happened to think to call it.
+// Same recursive-setTimeout, self-healing poll pattern already used for auction close-checking,
+// scheduled auction activation, and custodian notification — one payment's lookup failure (already
+// caught inside reconcileStalePayments itself) can't wedge future ticks, and this needs no wiring
+// beyond being started once at server boot (see index.ts).
+const RECONCILIATION_CHECK_INTERVAL_MS = 10 * 60 * 1000;
+
+export function startPaymentReconciliationLoop(): void {
+  async function tick() {
+    try {
+      await reconcileStalePayments();
+    } catch (err) {
+      logger.error({ err }, '[RECONCILE] check loop failed');
+    } finally {
+      setTimeout(tick, RECONCILIATION_CHECK_INTERVAL_MS);
+    }
+  }
+  setTimeout(tick, RECONCILIATION_CHECK_INTERVAL_MS);
+}

@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { UniqueConstraintError } from 'sequelize';
+import { Op, UniqueConstraintError } from 'sequelize';
 import { redis } from '../lib/redis.js';
 import { AuctionBid } from '../models/AuctionBid.js';
 import { AuctionBidAudit } from '../models/AuctionBidAudit.js';
@@ -27,6 +27,24 @@ export const MAX_BID_AMOUNT = 999999;
 export function sanitizeAmountForAudit(amount: number): string {
   if (!Number.isFinite(amount)) return '0';
   return String(Math.max(-MAX_BID_AMOUNT, Math.min(MAX_BID_AMOUNT, amount)));
+}
+
+// Same reasoning as sanitizeAmountForAudit above, clamped to returnPercent's own valid range
+// (0–100) instead of MAX_BID_AMOUNT — a rejected attempt with an out-of-range percent still needs
+// to be recorded without overflowing the DECIMAL(5,2) column it's stored in.
+export function sanitizePercentForAudit(percent: number): string {
+  if (!Number.isFinite(percent)) return '0';
+  return String(Math.max(0, Math.min(100, percent)));
+}
+
+// Landed-rate formula (product decision, not derived from anything in this codebase): a generator's
+// raw rate is discounted by their offered return% scaled against the tender/auction's equity value
+// and normalized by its total annual units — this discounted number, not the raw rate, is what
+// actually competes in the live auction (see submitBid below). Deliberately allowed to go negative
+// (a high enough return% can push it below zero) — flooring it at 0 would silently distort the
+// ranking this formula exists to produce.
+export function computeLandedRate(rate: number, returnPercent: number, equityValue: number, totalUnitsPerYear: number): number {
+  return rate - ((returnPercent / 100) * equityValue) / totalUnitsPerYear;
 }
 
 // Fixed platform-wide disclosure, not a per-auction toggle — see REGULATORY_CERTIFICATION_RESEARCH.md's
@@ -106,6 +124,15 @@ export interface AuctionRedisState {
   minUndercut: number;
   leaderParticipantId: number | null;
   leaderAlias: string | null;
+  // Constant for the lifetime of the auction, written once here and never updated afterward — safe
+  // for submitBid to read non-atomically alongside the Lua compare-and-set below. Forwarded to the
+  // frontend as-is via state:sync so a bidder's own landed-rate preview matches what the server will
+  // actually compute.
+  equityValue: number;
+  totalUnitsPerYear: number;
+  // Per-auction switch — see Auction.useLandedRate's own comment. When false, submitBid never
+  // calls computeLandedRate at all, regardless of what equityValue/totalUnitsPerYear happen to be.
+  useLandedRate: boolean;
 }
 
 export async function initAuctionState(
@@ -113,7 +140,10 @@ export async function initAuctionState(
   openingBid: number,
   windowSeconds: number,
   maxAutoExtensions: number,
-  minUndercut: number
+  minUndercut: number,
+  useLandedRate: boolean,
+  equityValue: number = 0,
+  totalUnitsPerYear: number = 0
 ) {
   await redis.hset(auctionKey(auctionId), {
     status: 'scheduled',
@@ -125,6 +155,9 @@ export async function initAuctionState(
     windowEndsAt: '0',
     leaderParticipantId: '',
     leaderAlias: '',
+    useLandedRate: useLandedRate ? '1' : '0',
+    equityValue: String(equityValue),
+    totalUnitsPerYear: String(totalUnitsPerYear),
   });
 }
 
@@ -132,6 +165,50 @@ export async function startAuctionClock(auctionId: number, windowSeconds: number
   const windowEndsAt = Date.now() + windowSeconds * 1000;
   await redis.hset(auctionKey(auctionId), { status: 'live', windowEndsAt: String(windowEndsAt) });
   return windowEndsAt;
+}
+
+// The two steps that take a promoted, scheduled auction live — factored out so both the precise
+// in-process timer (vettingAuctionBridge.ts's seedAuctionStandalone) and the self-healing check
+// below do exactly the same thing, not two independently-maintained copies of it.
+export async function activateScheduledAuction(auctionId: number, windowSeconds: number): Promise<void> {
+  await startAuctionClock(auctionId, windowSeconds);
+  await Auction.update({ status: 'live' }, { where: { id: auctionId } });
+}
+
+const SCHEDULED_AUCTION_CHECK_INTERVAL_MS = 60 * 1000;
+
+// Self-heals the vetting bridge's own documented gap: a server restart between promotion and the
+// scheduled start time loses the in-process setTimeout that would have called
+// activateScheduledAuction, leaving the auction stuck 'scheduled' forever with no automatic path
+// out. Auction.scheduledStartAt is null for every manually-seeded (auctionAdmin.ts) auction — those
+// go live immediately, no scheduling involved — so this only ever finds real promoted auctions.
+export async function activateOverdueScheduledAuctions(): Promise<void> {
+  const due = await Auction.findAll({ where: { status: 'scheduled', scheduledStartAt: { [Op.lte]: new Date() } } });
+  for (const auction of due) {
+    try {
+      await activateScheduledAuction(auction.id, auction.windowSeconds);
+      logger.info({ auctionId: auction.id }, '[AUCTION_SCHEDULE] check loop activated a missed scheduled auction');
+    } catch (err) {
+      logger.error({ err, auctionId: auction.id }, '[AUCTION_SCHEDULE] check loop failed to activate one auction — continuing');
+    }
+  }
+}
+
+// Same recursive-setTimeout, self-healing poll pattern already used for auction close-checking
+// (auctionSocket.ts's startCloseCheckLoop) — one auction's error can't wedge every future tick, and
+// a missed activation is caught within one interval of the server coming back up, not left stuck
+// until someone notices.
+export function startScheduledAuctionActivationLoop(): void {
+  async function tick() {
+    try {
+      await activateOverdueScheduledAuctions();
+    } catch (err) {
+      logger.error({ err }, '[AUCTION_SCHEDULE] check loop failed');
+    } finally {
+      setTimeout(tick, SCHEDULED_AUCTION_CHECK_INTERVAL_MS);
+    }
+  }
+  setTimeout(tick, SCHEDULED_AUCTION_CHECK_INTERVAL_MS);
 }
 
 // Restart resilience: rebuilds a 'live' auction's Redis state from its own MySQL row when Redis has
@@ -147,7 +224,16 @@ export async function startAuctionClock(auctionId: number, windowSeconds: number
 // a brand new full window starts from now rather than whatever time was actually left.
 export async function reconstructAuctionState(auction: Auction): Promise<void> {
   const resumeBid = Number(auction.currentLowestBid ?? auction.openingBid);
-  await initAuctionState(auction.id, resumeBid, auction.windowSeconds, auction.maxAutoExtensions, Number(auction.minUndercut));
+  await initAuctionState(
+    auction.id,
+    resumeBid,
+    auction.windowSeconds,
+    auction.maxAutoExtensions,
+    Number(auction.minUndercut),
+    auction.useLandedRate,
+    Number(auction.equityValue ?? 0),
+    Number(auction.totalUnitsPerYear ?? 0)
+  );
   if (auction.currentLeaderParticipantId !== null) {
     await redis.hset(auctionKey(auction.id), {
       leaderParticipantId: String(auction.currentLeaderParticipantId),
@@ -157,18 +243,35 @@ export async function reconstructAuctionState(auction: Auction): Promise<void> {
   await startAuctionClock(auction.id, auction.windowSeconds);
 }
 
-export async function submitBid(auctionId: number, amount: number, participantId: number, alias: string) {
+// Computes the landed rate in JS, then feeds it into the existing, unmodified Lua compare-and-set
+// script as the compared value — deliberately not touching SUBMIT_BID_LUA itself (its
+// atomicity/race-condition correctness is hard-won, see its own comments); only what number feeds
+// it changes. equityValue/totalUnitsPerYear are constant for the auction's lifetime (written once
+// at initAuctionState), so reading them here outside the atomic script is safe.
+export async function submitBid(auctionId: number, rate: number, returnPercent: number, participantId: number, alias: string) {
+  const [useLandedRateRaw, equityValueRaw, totalUnitsPerYearRaw] = await redis.hmget(
+    auctionKey(auctionId),
+    'useLandedRate',
+    'equityValue',
+    'totalUnitsPerYear'
+  );
+  // A normal-rate auction never runs the formula, full stop — regardless of what
+  // equityValue/totalUnitsPerYear happen to hold (they may be '0' or missing entirely for an
+  // auction that was never a landed-rate auction), so there's no divide-by-zero path here.
+  const landedRate =
+    useLandedRateRaw === '1' ? computeLandedRate(rate, returnPercent, Number(equityValueRaw), Number(totalUnitsPerYearRaw)) : rate;
+
   const [outcome, valueOrReason, extra] = await redis.submitBid(
     auctionKey(auctionId),
-    String(amount),
+    String(landedRate),
     String(Date.now()),
     String(participantId),
     alias
   );
   if (outcome === 'ACCEPTED') {
-    return { accepted: true as const, currentBid: Number(valueOrReason), windowEndsAt: Number(extra) };
+    return { accepted: true as const, landedRate, currentBid: Number(valueOrReason), windowEndsAt: Number(extra) };
   }
-  return { accepted: false as const, reason: valueOrReason, currentBid: Number(extra) };
+  return { accepted: false as const, landedRate, reason: valueOrReason, currentBid: Number(extra) };
 }
 
 export async function getAuctionState(auctionId: number): Promise<AuctionRedisState | null> {
@@ -184,6 +287,9 @@ export async function getAuctionState(auctionId: number): Promise<AuctionRedisSt
     minUndercut: Number(raw.minUndercut),
     leaderParticipantId: raw.leaderParticipantId ? Number(raw.leaderParticipantId) : null,
     leaderAlias: raw.leaderAlias || null,
+    equityValue: Number(raw.equityValue),
+    totalUnitsPerYear: Number(raw.totalUnitsPerYear),
+    useLandedRate: raw.useLandedRate === '1',
   };
 }
 
@@ -196,6 +302,8 @@ interface AuditedBidInput {
   participantId: number;
   alias: string;
   amount: string;
+  rate: string;
+  returnPercent: string;
   accepted: boolean;
   rejectReason: string | null;
   ipHash: string | null;
@@ -244,11 +352,17 @@ export async function appendAuditedBid(input: AuditedBidInput) {
     // row, recompute, compare) report a false mismatch even with zero tampering, since MySQL
     // silently reformats DECIMAL values on write.
     const normalizedAmount = Number(input.amount).toFixed(4);
+    // rate/returnPercent are hashed into the chain too, not just the derived amount — otherwise the
+    // tamper-evidence chain proves a landed rate was recorded but not what raw inputs produced it.
+    const normalizedRate = Number(input.rate).toFixed(4);
+    const normalizedReturnPercent = Number(input.returnPercent).toFixed(2);
     const content = JSON.stringify({
       auctionId: input.auctionId,
       participantId: input.participantId,
       alias: input.alias,
       amount: normalizedAmount,
+      rate: normalizedRate,
+      returnPercent: normalizedReturnPercent,
       accepted: input.accepted,
       rejectReason: input.rejectReason,
       ipHash: input.ipHash,
@@ -287,6 +401,8 @@ export async function appendAuditedBid(input: AuditedBidInput) {
         participantId: input.participantId,
         alias: input.alias,
         amount: normalizedAmount,
+        rate: normalizedRate,
+        returnPercent: normalizedReturnPercent,
         accepted: input.accepted,
         rejectReason: input.rejectReason,
         ipHash: input.ipHash,
@@ -385,6 +501,8 @@ export async function buildAndStoreResultSummary(
     bidChronology: bids.map((b) => ({
       alias: b.alias,
       amount: b.amount,
+      rate: b.rate,
+      returnPercent: b.returnPercent,
       accepted: b.accepted,
       rejectReason: b.rejectReason,
       createdAt: b.createdAt,

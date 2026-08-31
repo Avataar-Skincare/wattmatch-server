@@ -149,3 +149,39 @@ export async function generateInvoiceForPayment(payment: Payment): Promise<Invoi
   );
   return invoice;
 }
+
+const INVOICE_CHECK_INTERVAL_MS = 15 * 60 * 1000;
+
+// Self-heals paymentStateMachine.ts's fire-and-forget call to generateInvoiceForPayment: that call
+// is deliberately not awaited (invoice generation must never add latency to, or fail, the payment
+// confirmation itself), which previously meant a failure there — a transient S3 error, a PDF render
+// bug — was logged once and then permanently forgotten, with no retry and no way for the buyer to
+// tell "not generated yet" from "never will be." generateInvoiceForPayment is already idempotent
+// (guards on an existing Invoice row), so this can safely re-attempt every paid payment that's
+// still missing one, on the same self-healing-poll pattern as the other loops in this codebase.
+export async function generateMissingInvoices(): Promise<void> {
+  const paidPayments = await Payment.findAll({ where: { status: 'paid' } });
+  for (const payment of paidPayments) {
+    try {
+      const existing = await Invoice.findOne({ where: { paymentId: payment.id } });
+      if (existing) continue;
+      await generateInvoiceForPayment(payment);
+      logger.info({ paymentId: payment.id }, '[INVOICE] check loop generated a previously-missing invoice');
+    } catch (err) {
+      logger.error({ err, paymentId: payment.id }, '[INVOICE] check loop failed for one payment — will retry next tick');
+    }
+  }
+}
+
+export function startInvoiceGenerationCheckLoop(): void {
+  async function tick() {
+    try {
+      await generateMissingInvoices();
+    } catch (err) {
+      logger.error({ err }, '[INVOICE] check loop failed');
+    } finally {
+      setTimeout(tick, INVOICE_CHECK_INTERVAL_MS);
+    }
+  }
+  setTimeout(tick, INVOICE_CHECK_INTERVAL_MS);
+}

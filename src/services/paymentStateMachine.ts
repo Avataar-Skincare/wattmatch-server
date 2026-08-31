@@ -1,5 +1,8 @@
 import type { Payment, PaymentStatus } from '../models/Payment.js';
+import { Tender } from '../models/Tender.js';
 import { generateInvoiceForPayment } from './invoiceService.js';
+import { sendTenderDocumentEmail } from './email.js';
+import { readObject } from '../lib/s3.js';
 import { logger } from '../lib/logger.js';
 
 // Single source of truth for which Payment.status transitions are legal — /payment/verify, the
@@ -61,7 +64,38 @@ export async function transitionPayment(
     generateInvoiceForPayment(payment).catch((err) => {
       logger.error({ err, paymentId: payment.id }, '[PAYMENT_STATE] invoice generation failed — payment confirmation unaffected');
     });
+
+    // Emails the full tender document the moment the fee that unlocks it clears — the in-app
+    // download (RfsDocumentPurchasePage.tsx) already happens client-side right after verify, this is
+    // the durable second copy for an account-less purchaser who may not be looking at that tab any
+    // more. Fire-and-forget, same reasoning as the invoice above: never adds latency to, or can fail,
+    // the payment confirmation itself.
+    if (payment.purpose === 'rfs_document' && payment.payerEmail) {
+      sendRfsDocumentEmailForPayment(payment).catch((err) => {
+        logger.error({ err, paymentId: payment.id }, '[PAYMENT_STATE] tender document email failed — payment confirmation unaffected');
+      });
+    }
   }
 
   return { applied: true };
+}
+
+async function sendRfsDocumentEmailForPayment(payment: Payment): Promise<void> {
+  const tender = await Tender.findByPk(payment.tenderId);
+  if (!tender || !tender.tenderDocumentS3Key) {
+    // Nothing uploaded yet at payment time — no established mechanism in this codebase re-sends it
+    // later if admin uploads one afterward; the in-app download path still picks it up whenever it
+    // does show up, this email is just the immediate best-effort copy.
+    logger.info({ paymentId: payment.id, tenderId: payment.tenderId }, '[PAYMENT_STATE] no tender document to email yet — skipped');
+    return;
+  }
+  const content = await readObject(tender.tenderDocumentS3Key);
+  if (!content) {
+    logger.error({ paymentId: payment.id, tenderId: payment.tenderId }, '[PAYMENT_STATE] tender document upload record exists but object body is missing — skipped');
+    return;
+  }
+  await sendTenderDocumentEmail(payment.payerEmail as string, tender.title, {
+    filename: tender.tenderDocumentOriginalFilename ?? 'tender-document.pdf',
+    content,
+  });
 }

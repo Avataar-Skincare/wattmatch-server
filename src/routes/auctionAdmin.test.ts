@@ -12,6 +12,9 @@ function validBody(overrides: Record<string, unknown> = {}) {
     openingBid: 6.5,
     windowSeconds: 300,
     maxAutoExtensions: 5,
+    useLandedRate: true,
+    equityValue: 1000000,
+    totalUnitsPerYear: 500000,
     participants: [{ organizationName: 'Gen A', alias: 'GEN-A' }],
     ...overrides,
   };
@@ -70,6 +73,16 @@ describe('seedBodySchema', () => {
 
   it('accepts maxAutoExtensions of exactly 0 (non-negative, not "must be positive")', () => {
     expect(seedBodySchema.safeParse(validBody({ maxAutoExtensions: 0 })).success).toBe(true);
+  });
+
+  it('accepts useLandedRate: false with equityValue/totalUnitsPerYear omitted', () => {
+    const { equityValue, totalUnitsPerYear, ...rest } = validBody({ useLandedRate: false });
+    expect(seedBodySchema.safeParse(rest).success).toBe(true);
+  });
+
+  it('rejects useLandedRate: true with equityValue/totalUnitsPerYear omitted', () => {
+    const { equityValue, totalUnitsPerYear, ...rest } = validBody();
+    expect(seedBodySchema.safeParse(rest).success).toBe(false);
   });
 
   it('rejects an empty participants array', () => {

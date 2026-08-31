@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import rateLimit from 'express-rate-limit';
+import { jsonRateLimit as rateLimit } from '../lib/rateLimit.js';
 import { z } from 'zod';
 import { Op } from 'sequelize';
 import { Payment, type PaymentPurpose } from '../models/Payment.js';
@@ -11,29 +11,15 @@ import { transitionPayment } from '../services/paymentStateMachine.js';
 import { reconcileStalePayments } from '../services/paymentReconciliationService.js';
 import { refundPayment } from '../services/paymentRefundService.js';
 import { getRazorpayConfig } from '../lib/razorpayConfig.js';
-import { verifyOrgToken, type OrgTokenPayload } from '../lib/orgAuth.js';
 import { Invoice } from '../models/Invoice.js';
 import { getSignedDownloadUrl } from '../lib/s3.js';
+import { authRequired, optionalAuth } from '../middleware/auth.js';
 import { logger } from '../lib/logger.js';
 
 const router = Router();
 
 const MAX_STRING_FIELD_LENGTH = 255;
 const orderLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
-
-function extractBearerToken(authHeader: string | undefined): string | undefined {
-  return authHeader?.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : undefined;
-}
-
-async function requireOrgAuth(authHeader: string | undefined): Promise<OrgTokenPayload | null> {
-  const token = extractBearerToken(authHeader);
-  if (!token) return null;
-  try {
-    return await verifyOrgToken(token);
-  } catch {
-    return null;
-  }
-}
 
 // Both schemas explicitly do NOT declare an `amount`/`amountPaise` field — Zod's default (strict
 // object shape via .strict() below) means a body that includes one is rejected outright, rather
@@ -187,11 +173,8 @@ router.post('/payment/orders/rfs-document', orderLimiter, async (req, res, next)
 // Authenticated — the Bid Processing Fee requires a real, logged-in organization. organizationId
 // always comes from the verified token, NEVER from the request body — otherwise any caller could
 // create a payment order that looks like it belongs to a different org.
-router.post('/payment/orders', orderLimiter, async (req, res, next) => {
+router.post('/payment/orders', orderLimiter, ...authRequired(), async (req, res, next) => {
   try {
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-
     const parsed = orgOrderBodySchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ success: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
@@ -203,7 +186,7 @@ router.post('/payment/orders', orderLimiter, async (req, res, next) => {
     const result = await createPaymentOrder({
       purpose: parsed.data.purpose,
       tenderId: parsed.data.tenderId,
-      organizationId: payload.organizationId,
+      organizationId: req.org!.id,
       payerName: null,
       payerEmail: null,
       notes: null,
@@ -277,7 +260,7 @@ router.post('/payment/verify', verifyLimiter, async (req, res, next) => {
 // reasoning).
 const invoiceLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
 
-router.get('/payment/:id/invoice', invoiceLimiter, async (req, res, next) => {
+router.get('/payment/:id/invoice', invoiceLimiter, optionalAuth, async (req, res, next) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'Invalid payment id' });
@@ -286,8 +269,7 @@ router.get('/payment/:id/invoice', invoiceLimiter, async (req, res, next) => {
     if (!payment) return res.status(404).json({ success: false, error: 'Payment not found' });
 
     if (payment.organizationId !== null) {
-      const payload = await requireOrgAuth(req.headers.authorization);
-      if (!payload || payload.organizationId !== payment.organizationId) {
+      if (!req.org || req.org.id !== payment.organizationId) {
         return res.status(403).json({ success: false, error: 'Not authorized to view this invoice' });
       }
     } else {
@@ -298,7 +280,10 @@ router.get('/payment/:id/invoice', invoiceLimiter, async (req, res, next) => {
     }
 
     const invoice = await Invoice.findOne({ where: { paymentId: id } });
-    if (!invoice) return res.status(404).json({ success: false, error: 'No invoice has been generated for this payment yet' });
+    // Accurate, not just optimistic wording: invoiceService.ts's self-healing check retries any
+    // paid payment missing an invoice every 15 minutes, so "not yet" really does mean "check back
+    // shortly," not a silent permanent failure with no automatic recovery.
+    if (!invoice) return res.status(404).json({ success: false, error: 'No invoice has been generated for this payment yet — check back shortly' });
 
     const url = await getSignedDownloadUrl(invoice.s3Key);
     res.json({ success: true, invoiceNumber: invoice.invoiceNumber, isTaxInvoice: Boolean(invoice.sellerGstin), url });
@@ -369,14 +354,8 @@ router.post('/payment/webhook', webhookLimiter, async (req, res) => {
 // minutes and asks Razorpay directly what actually happened to it.
 const reconcileLimiter = rateLimit({ windowMs: 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
 
-router.post('/payment/reconcile', reconcileLimiter, async (req, res, next) => {
+router.post('/payment/reconcile', reconcileLimiter, ...authRequired('admin'), async (req, res, next) => {
   try {
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-    if (payload.type !== 'admin') {
-      return res.status(403).json({ success: false, error: 'Only admin organizations can trigger reconciliation' });
-    }
-
     const result = await reconcileStalePayments();
     logger.info({ reqId: req.requestId, ...result }, '[PAYMENT] reconciliation run');
     res.json({ success: true, ...result });
@@ -398,14 +377,8 @@ const refundBodySchema = z
 
 const refundLimiter = rateLimit({ windowMs: 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
 
-router.post('/payment/:id/refund', refundLimiter, async (req, res, next) => {
+router.post('/payment/:id/refund', refundLimiter, ...authRequired('admin'), async (req, res, next) => {
   try {
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-    if (payload.type !== 'admin') {
-      return res.status(403).json({ success: false, error: 'Only admin organizations can trigger a refund' });
-    }
-
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'Invalid payment id' });
 

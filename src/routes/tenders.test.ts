@@ -4,11 +4,14 @@ import { Organization } from '../models/Organization.js';
 import { Tender } from '../models/Tender.js';
 import { TenderInvitation } from '../models/TenderInvitation.js';
 import { Payment } from '../models/Payment.js';
+import { Auction } from '../models/Auction.js';
+import { signOrgToken } from '../lib/orgAuth.js';
 
 let app: express.Express;
 let server: ReturnType<express.Express['listen']>;
 let baseUrl: string;
 let buyerOrgId: number;
+let buyerToken: string;
 let tenderId: number;
 
 const createdOrgIds: number[] = [];
@@ -32,6 +35,7 @@ beforeAll(async () => {
 
   const buyer = await Organization.create({ type: 'buyer', name: 'Enroll Test Buyer', contactEmail: `enroll-test-buyer-${Date.now()}@test.local`, contactPhone: '9000000000' });
   buyerOrgId = buyer.id;
+  buyerToken = await signOrgToken({ organizationId: buyer.id, type: 'buyer' });
   createdOrgIds.push(buyer.id);
 
   const tender = await Tender.create({ buyerOrgId, title: `Enroll test tender ${Date.now()}`, requiredCapacityMw: '5' });
@@ -56,6 +60,11 @@ async function post(path: string, body: unknown, token?: string) {
     headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     body: JSON.stringify(body),
   });
+  return { status: res.status, body: await res.json() };
+}
+
+async function get(path: string, token?: string) {
+  const res = await fetch(`${baseUrl}${path}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
   return { status: res.status, body: await res.json() };
 }
 
@@ -127,5 +136,67 @@ describe('POST /tenders/:id/enroll', () => {
     const res = await post(`/api/tenders/${tenderId}/enroll`, { email });
     expect(res.status).toBe(409);
     expect(res.body.accountExists).toBe(true);
+  });
+});
+
+describe('GET /tenders/mine-as-buyer', () => {
+  const createdTenderIds: number[] = [];
+  const createdAuctionIds: number[] = [];
+
+  afterAll(async () => {
+    for (const id of createdAuctionIds) await Auction.destroy({ where: { id } });
+    for (const id of createdTenderIds) await Tender.destroy({ where: { id } });
+  });
+
+  it('rejects with no token', async () => {
+    const res = await get('/api/tenders/mine-as-buyer');
+    expect(res.status).toBe(401);
+  });
+
+  it('returns an empty list for a buyer with no tenders', async () => {
+    const freshBuyer = await Organization.create({ type: 'buyer', name: 'No Tenders Buyer', contactEmail: `no-tenders-buyer-${Date.now()}@test.local`, contactPhone: '9000000003' });
+    createdOrgIds.push(freshBuyer.id);
+    const freshToken = await signOrgToken({ organizationId: freshBuyer.id, type: 'buyer' });
+
+    const res = await get('/api/tenders/mine-as-buyer', freshToken);
+    expect(res.status).toBe(200);
+    expect(res.body.tenders).toEqual([]);
+  });
+
+  it('lists only this buyer\'s own tenders, with auction info once promoted, and none of another buyer\'s', async () => {
+    const otherBuyer = await Organization.create({ type: 'buyer', name: 'Other Buyer', contactEmail: `other-buyer-${Date.now()}@test.local`, contactPhone: '9000000004' });
+    createdOrgIds.push(otherBuyer.id);
+
+    const ownTenderNoAuction = await Tender.create({ buyerOrgId, title: `Mine, no auction ${Date.now()}`, requiredCapacityMw: '3' });
+    createdTenderIds.push(ownTenderNoAuction.id);
+
+    const ownTenderWithAuction = await Tender.create({ buyerOrgId, title: `Mine, promoted ${Date.now()}`, requiredCapacityMw: '4' });
+    createdTenderIds.push(ownTenderWithAuction.id);
+    const auction = await Auction.create({
+      title: `Auction for ${ownTenderWithAuction.id}`,
+      status: 'live',
+      openingBid: '10.0000',
+      windowSeconds: 480,
+      maxAutoExtensions: 8,
+      minUndercut: '0.01',
+      tenderRef: ownTenderWithAuction.id,
+    });
+    createdAuctionIds.push(auction.id);
+
+    const otherTender = await Tender.create({ buyerOrgId: otherBuyer.id, title: `Not mine ${Date.now()}`, requiredCapacityMw: '9' });
+    createdTenderIds.push(otherTender.id);
+
+    const res = await get('/api/tenders/mine-as-buyer', buyerToken);
+    expect(res.status).toBe(200);
+    const ids = res.body.tenders.map((t: { id: number }) => t.id);
+    expect(ids).toContain(ownTenderNoAuction.id);
+    expect(ids).toContain(ownTenderWithAuction.id);
+    expect(ids).not.toContain(otherTender.id);
+
+    const withAuction = res.body.tenders.find((t: { id: number }) => t.id === ownTenderWithAuction.id);
+    expect(withAuction.auction).toEqual({ id: auction.id, status: 'live' });
+
+    const withoutAuction = res.body.tenders.find((t: { id: number }) => t.id === ownTenderNoAuction.id);
+    expect(withoutAuction.auction).toBeNull();
   });
 });

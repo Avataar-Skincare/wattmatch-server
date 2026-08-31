@@ -1,21 +1,21 @@
 import { Router } from 'express';
-import rateLimit from 'express-rate-limit';
+import { jsonRateLimit as rateLimit } from '../lib/rateLimit.js';
 import { z } from 'zod';
 import crypto from 'node:crypto';
 import { Op } from 'sequelize';
 import { VettingBid } from '../models/VettingBid.js';
-import { VettingOpeningAttestation } from '../models/VettingOpeningAttestation.js';
+import { VettingOpeningAttestation, type VettingEnvelope } from '../models/VettingOpeningAttestation.js';
 import { VettingDecidedRecord } from '../models/VettingDecidedRecord.js';
-import { Organization } from '../models/Organization.js';
 import { TenderInvitation } from '../models/TenderInvitation.js';
+import { Tender } from '../models/Tender.js';
 import { Payment } from '../models/Payment.js';
 import { TenderDocumentField } from '../models/TenderDocumentField.js';
 import { TenderDocumentUpload } from '../models/TenderDocumentUpload.js';
 import { EmdSubmission } from '../models/EmdSubmission.js';
-import { reconstructPrivateKey, openEnvelope, type SealedEnvelope } from '../lib/vettingCrypto.js';
-import { encryptField } from '../lib/fieldEncryption.js';
-import { verifyOrgToken } from '../lib/orgAuth.js';
+import { hasRfsDocumentPaid } from '../services/rfsDocumentAccessService.js';
+import { encryptField, decryptField } from '../lib/fieldEncryption.js';
 import { logger } from '../lib/logger.js';
+import { authRequired } from '../middleware/auth.js';
 
 const router = Router();
 
@@ -42,15 +42,6 @@ const submitBodySchema = z.object({
   financial: envelopeSchema,
 });
 
-const shareArraySchema = z.array(z.string().min(1)).length(2, 'exactly two custodian shares are required');
-
-const openTechnicalBodySchema = z.object({
-  tenderRef: z.string().trim().min(1).max(MAX_STRING_FIELD_LENGTH),
-  shares: shareArraySchema,
-  isEmergency: z.boolean().optional().default(false),
-  emergencyJustification: z.string().trim().max(2000).optional(),
-});
-
 const technicalDecisionBodySchema = z.object({
   decision: z.enum(['approved', 'rejected']),
   // The evaluator's confirmed copy of what the ceremony revealed for this submission — the server
@@ -61,21 +52,16 @@ const technicalDecisionBodySchema = z.object({
   reviewedContent: z.string().min(1).max(MAX_ENVELOPE_FIELD_LENGTH * 4),
 });
 
-const openFinancialBodySchema = z.object({
-  tenderRef: z.string().trim().min(1).max(MAX_STRING_FIELD_LENGTH),
-  shares: shareArraySchema,
-});
+const openedContentQuerySchema = z.object({ envelope: z.enum(['technical', 'financial']) });
 
-// Submission now requires a real generator org token + accepted invitation (see the route below).
-// The ceremony/decision/public-keys/list routes remain unauthenticated, matching this codebase's
-// existing pattern for admin-operated routes — rate limiting is the cheap bound in the meantime.
-// The one exception, per AUTH_STRATEGY_DECISIONS.md: /decided-record specifically is planned for
-// email+password auth before real data ever flows through it, since it holds settled bid/KYC
-// content — not built in this pass, flagged here so it isn't mistaken for an oversight.
+// Submission requires a real generator org token + accepted invitation (see the route below).
+// Ceremonies now happen entirely through routes/vettingCustodian.ts, authenticated by a custodian's
+// own emailed link, not an admin login — see that file's own comment for why. Decisions and the
+// list/decided-record/opened views here stay admin-only (authRequired('admin')); public-keys is
+// any-authenticated-org since the keys aren't secret, but gating it removes anonymous surface area
+// for free — there's no legitimate anonymous caller.
 const submitLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false });
-// Ceremonies are inherently rare, manual actions — this limit exists only to bound scripted abuse,
-// not to constrain legitimate use, so it's generous (matches auctionAdmin.ts's exportLimiter).
-const ceremonyLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
+const decisionLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
 const readLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
 
 function getTechnicalKeyConfig() {
@@ -92,23 +78,11 @@ function getFinancialKeyConfig() {
   return { publicKeyPem, fingerprint };
 }
 
-function decodeShares(shares: string[]): Uint8Array[] {
-  return shares.map((s) => new Uint8Array(Buffer.from(s, 'base64')));
-}
-
-function extractBearerToken(authHeader: string | undefined): string | undefined {
-  return authHeader?.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : undefined;
-}
-
-function hashOpenedSet(ids: number[]): string {
-  return crypto.createHash('sha256').update(JSON.stringify(ids.sort((a, b) => a - b))).digest('hex');
-}
-
 // Submission — seals both envelopes client-side before this is ever called; this route only
 // stores opaque ciphertext, never plaintext, for either envelope. Also gated on invitation: a
 // generator must hold a valid token AND an 'accepted' TenderInvitation for this tenderRef, closing
 // the gap where any caller could submit a bid against any tenderRef under a made-up name.
-router.post('/vetting-bids', submitLimiter, async (req, res, next) => {
+router.post('/vetting-bids', submitLimiter, ...authRequired('generator'), async (req, res, next) => {
   try {
     const parsed = submitBodySchema.safeParse(req.body);
     if (!parsed.success) {
@@ -116,25 +90,19 @@ router.post('/vetting-bids', submitLimiter, async (req, res, next) => {
     }
     const { tenderRef, technical, financial } = parsed.data;
 
-    const token = extractBearerToken(req.headers.authorization);
-    if (!token) return res.status(401).json({ success: false, error: 'Missing organization token' });
-    let orgPayload;
-    try {
-      orgPayload = await verifyOrgToken(token);
-    } catch {
-      return res.status(401).json({ success: false, error: 'Invalid or expired token' });
-    }
-    if (orgPayload.type !== 'generator') {
-      return res.status(403).json({ success: false, error: 'Only generator organizations submit bids' });
-    }
-
-    const generatorOrg = await Organization.findByPk(orgPayload.organizationId);
-    if (!generatorOrg) return res.status(401).json({ success: false, error: 'Unknown organization' });
+    const generatorOrg = req.org!;
 
     const tenderId = Number(tenderRef);
     if (!Number.isFinite(tenderId)) {
       return res.status(400).json({ success: false, error: 'tenderRef must be a real tender id' });
     }
+
+    const tender = await Tender.findByPk(tenderId);
+    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
+    if (tender.bidSubmissionDeadline && Date.now() > tender.bidSubmissionDeadline.getTime()) {
+      return res.status(409).json({ success: false, error: 'The bid submission deadline for this tender has passed' });
+    }
+
     const invitation = await TenderInvitation.findOne({
       where: { tenderId, organizationId: generatorOrg.id, status: 'accepted' },
     });
@@ -142,17 +110,35 @@ router.post('/vetting-bids', submitLimiter, async (req, res, next) => {
       return res.status(403).json({ success: false, error: 'You must accept this tender\'s invitation before submitting a bid' });
     }
 
-    // Payment gate (TENDER_WORKFLOW_STAKEHOLDER_PLAN.md Stage 6): the Bid Processing Fee is due
-    // BEFORE final submission, not after. e-KYC (also in that Stage 6 sequence) has no gate here
-    // yet — it's still blocked on a vendor decision, flagged elsewhere, not silently skipped.
+    // One sealed bid per generator per tender — nothing else in this pipeline expects more than one
+    // (the vetting queue, technical/financial decisions, and the eventual auction seat all key off a
+    // single VettingBid per generatorOrgId+tenderRef). Without this, the frontend leaving the form
+    // open and reachable after a successful submission (GeneratorBidSubmissionPage) had no server-side
+    // backstop against a second, duplicate submission.
+    const existingBid = await VettingBid.findOne({ where: { tenderRef: String(tenderId), generatorOrgId: generatorOrg.id } });
+    if (existingBid) {
+      return res.status(409).json({ success: false, error: 'You have already submitted a bid for this tender', bidId: existingBid.id });
+    }
+
+    // Payment gate (TENDER_WORKFLOW_STAKEHOLDER_PLAN.md Stage 6): both the RfS Document fee and the
+    // Bid Processing Fee are due BEFORE final submission, not after. The RfS Document fee is
+    // re-checked here (on top of invitations/respond's own check on accept) rather than trusted from
+    // acceptance time — an invitation accepted before that check existed, or before the fee was ever
+    // paid under some other gap, must not still be able to reach a real bid submission; this route is
+    // the actual point that matters; accept-time is just the earliest place to give a clear error.
+    // e-KYC (also in that Stage 6 sequence) has no gate here yet — it's still blocked on a vendor
+    // decision, flagged elsewhere, not silently skipped.
+    const missingFees: string[] = [];
+    if (!(await hasRfsDocumentPaid(tenderId, generatorOrg.contactEmail))) missingFees.push('RfS Document Fee');
     const bidProcessingPayment = await Payment.findOne({
       where: { tenderId, organizationId: generatorOrg.id, purpose: 'bid_processing', status: 'paid' },
     });
-    if (!bidProcessingPayment) {
+    if (!bidProcessingPayment) missingFees.push('Bid Processing Fee');
+    if (missingFees.length > 0) {
       return res.status(402).json({
         success: false,
-        error: 'The following fees must be paid before submitting a bid: Bid Processing Fee',
-        missingFees: ['Bid Processing Fee'],
+        error: `The following fees must be paid before submitting a bid: ${missingFees.join(', ')}`,
+        missingFees,
       });
     }
 
@@ -215,62 +201,14 @@ router.post('/vetting-bids', submitLimiter, async (req, res, next) => {
   }
 });
 
-// Technical ceremony — any two of the three technical custodian shares. Reveals plaintext for
-// every pending submission in this tenderRef; decides nothing. See the plan's "Post-decision
-// durable storage" section for why this plaintext is not itself persisted by this step.
-router.post('/vetting-bids/open-technical', ceremonyLimiter, async (req, res, next) => {
-  try {
-    const parsed = openTechnicalBodySchema.safeParse(req.body);
-    if (!parsed.success) {
-      return res.status(400).json({ success: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
-    }
-    const { tenderRef, shares, isEmergency, emergencyJustification } = parsed.data;
-    if (isEmergency && !emergencyJustification) {
-      return res.status(400).json({ success: false, error: 'emergencyJustification is required when isEmergency is true' });
-    }
-
-    const { fingerprint } = getTechnicalKeyConfig();
-    const privateKey = await reconstructPrivateKey(decodeShares(shares), fingerprint);
-
-    const bids = await VettingBid.findAll({ where: { tenderRef, technicalStatus: 'pending' } });
-    const opened = bids.map((bid) => ({
-      id: bid.id,
-      applicantAlias: bid.applicantAlias,
-      content: openEnvelope(privateKey, {
-        wrappedDataKey: bid.technicalWrappedKey,
-        iv: bid.technicalIv,
-        ciphertext: bid.technicalCiphertext,
-      } as SealedEnvelope),
-    }));
-
-    const shareFingerprints = shares.map((s) => crypto.createHash('sha256').update(Buffer.from(s, 'base64')).digest('hex'));
-    await VettingOpeningAttestation.create({
-      tenderRef,
-      envelope: 'technical',
-      openedSetHash: hashOpenedSet(opened.map((o) => o.id)),
-      shareFingerprint1: shareFingerprints[0],
-      shareFingerprint2: shareFingerprints[1],
-      isEmergency,
-      emergencyJustification: emergencyJustification ?? null,
-    });
-
-    logger.info(
-      { reqId: req.requestId, tenderRef, openedCount: opened.length, isEmergency },
-      '[VETTING] technical ceremony completed'
-    );
-
-    res.json({ success: true, opened });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// Technical decision — a separate action from the ceremony above by design: cryptographic opening
-// and business approval are different things. Also the point where content moves into durable,
-// KMS-protected storage (VettingDecidedRecord) — see the plan for why this must happen for BOTH
-// approved and rejected submissions (a rejected generator disputing their rejection still needs
-// the record to exist later).
-router.post('/vetting-bids/:id/technical-decision', ceremonyLimiter, async (req, res, next) => {
+// Technical decision — a separate action from the custodian ceremony (routes/vettingCustodian.ts) by
+// design: cryptographic opening and business approval are different things. Also the point where
+// content moves into durable, KMS-protected storage (VettingDecidedRecord) — this must happen for
+// BOTH approved and rejected submissions (a rejected generator disputing their rejection still needs
+// the record to exist later). reviewedContent is the admin's confirmed copy of what
+// GET /vetting-bids/:tenderRef/opened/technical showed them — the server never re-derives this
+// itself, it durably records what was legitimately reviewed.
+router.post('/vetting-bids/:id/technical-decision', decisionLimiter, ...authRequired('admin'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'Invalid submission id' });
@@ -312,67 +250,10 @@ router.post('/vetting-bids/:id/technical-decision', ceremonyLimiter, async (req,
   }
 });
 
-// Financial ceremony — gated on at least one technical decision existing for the tender, and
-// only ever decrypts APPROVED submissions' financial envelopes. A rejected submission's financial
-// envelope is never decrypted, full stop — not filtered out of the response, never touched at all.
-router.post('/vetting-bids/open-financial', ceremonyLimiter, async (req, res, next) => {
-  try {
-    const parsed = openFinancialBodySchema.safeParse(req.body);
-    if (!parsed.success) {
-      return res.status(400).json({ success: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
-    }
-    const { tenderRef, shares } = parsed.data;
-
-    // A recorded decision means technicalStatus has moved off 'pending' — checking for the
-    // ceremony *attestation* instead (as an earlier version of this did) is a different, weaker
-    // condition: it would let the financial ceremony run right after the technical one, before
-    // any actual decision was ever made.
-    const hasDecision = await VettingBid.findOne({ where: { tenderRef, technicalStatus: { [Op.ne]: 'pending' } } });
-    if (!hasDecision) {
-      return res.status(409).json({ success: false, error: 'No technical decision exists yet for this tender — cannot open financial envelopes' });
-    }
-
-    const { fingerprint } = getFinancialKeyConfig();
-    const privateKey = await reconstructPrivateKey(decodeShares(shares), fingerprint);
-
-    const approvedBids = await VettingBid.findAll({ where: { tenderRef, technicalStatus: 'approved' } });
-    const opened = [];
-    for (const bid of approvedBids) {
-      const content = openEnvelope(privateKey, {
-        wrappedDataKey: bid.financialWrappedKey,
-        iv: bid.financialIv,
-        ciphertext: bid.financialCiphertext,
-      } as SealedEnvelope);
-      opened.push({ id: bid.id, applicantAlias: bid.applicantAlias, content });
-      await VettingDecidedRecord.create({
-        vettingBidId: bid.id,
-        envelope: 'financial',
-        encryptedContent: await encryptField(content),
-        decidedAt: new Date(),
-      });
-    }
-
-    const shareFingerprints = shares.map((s) => crypto.createHash('sha256').update(Buffer.from(s, 'base64')).digest('hex'));
-    await VettingOpeningAttestation.create({
-      tenderRef,
-      envelope: 'financial',
-      openedSetHash: hashOpenedSet(opened.map((o) => o.id)),
-      shareFingerprint1: shareFingerprints[0],
-      shareFingerprint2: shareFingerprints[1],
-      isEmergency: false,
-    });
-
-    logger.info({ reqId: req.requestId, tenderRef, openedCount: opened.length }, '[VETTING] financial ceremony completed');
-
-    res.json({ success: true, opened });
-  } catch (err) {
-    next(err);
-  }
-});
-
 // Lists a tender's submissions without revealing any sealed content — just enough for an admin
-// dashboard to show what exists and its current technicalStatus before running a ceremony.
-router.get('/vetting-bids', readLimiter, async (req, res, next) => {
+// dashboard to show what exists, its current technicalStatus, and whether a custodian ceremony has
+// already opened content admin can review (routes/vettingCustodian.ts).
+router.get('/vetting-bids', readLimiter, ...authRequired('admin'), async (req, res, next) => {
   try {
     const tenderRef = typeof req.query.tenderRef === 'string' ? req.query.tenderRef : undefined;
     if (!tenderRef) return res.status(400).json({ success: false, error: 'tenderRef query parameter is required' });
@@ -380,14 +261,50 @@ router.get('/vetting-bids', readLimiter, async (req, res, next) => {
     const bids = await VettingBid.findAll({ where: { tenderRef }, order: [['id', 'ASC']] });
     res.json({
       success: true,
-      bids: bids.map((b) => ({ id: b.id, applicantAlias: b.applicantAlias, technicalStatus: b.technicalStatus, createdAt: b.createdAt })),
+      bids: bids.map((b) => ({
+        id: b.id,
+        applicantAlias: b.applicantAlias,
+        technicalStatus: b.technicalStatus,
+        createdAt: b.createdAt,
+        hasOpenedTechnicalContent: b.technicalOpenedContent !== null,
+        hasOpenedFinancialContent: b.financialOpenedContent !== null,
+      })),
     });
   } catch (err) {
     next(err);
   }
 });
 
-router.get('/vetting-bids/public-keys', readLimiter, async (req, res, next) => {
+// Admin-only read of what a custodian ceremony opened for this tender/envelope — the source admin
+// copies from into technical-decision's reviewedContent. Separate from decided-record: that route
+// serves durable, already-decided history; this one serves the in-between "opened, awaiting a
+// decision" state that only exists on VettingBid's own opened-content columns.
+router.get('/vetting-bids/:tenderRef/opened/:envelope', readLimiter, ...authRequired('admin'), async (req, res, next) => {
+  try {
+    const parsedQuery = openedContentQuerySchema.safeParse({ envelope: req.params.envelope });
+    if (!parsedQuery.success) return res.status(400).json({ success: false, error: 'envelope must be "technical" or "financial"' });
+    const { envelope } = parsedQuery.data;
+
+    const where = envelope === 'technical'
+      ? { tenderRef: req.params.tenderRef, technicalOpenedContent: { [Op.ne]: null } }
+      : { tenderRef: req.params.tenderRef, financialOpenedContent: { [Op.ne]: null } };
+    const bids = await VettingBid.findAll({ where });
+
+    const opened = await Promise.all(
+      bids.map(async (b) => ({
+        id: b.id,
+        applicantAlias: b.applicantAlias,
+        content: await decryptField((envelope === 'technical' ? b.technicalOpenedContent : b.financialOpenedContent)!),
+      }))
+    );
+
+    res.json({ success: true, envelope, opened });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/vetting-bids/public-keys', readLimiter, ...authRequired(), async (req, res, next) => {
   try {
     const technical = getTechnicalKeyConfig();
     const financial = getFinancialKeyConfig();
@@ -401,11 +318,10 @@ router.get('/vetting-bids/public-keys', readLimiter, async (req, res, next) => {
   }
 });
 
-// Authenticated, access-logged read of durable post-decision content. Auth mechanism decided
-// (email + password, see AUTH_STRATEGY_DECISIONS.md) but not built in this pass — deferred
-// deliberately, not an oversight. Do not expose this route in any real deployment before that
-// lands.
-router.get('/vetting-bids/:id/decided-record', readLimiter, async (req, res, next) => {
+// Authenticated, access-logged read of durable post-decision content. Admin-only, same as every
+// other vetting-decision route — this holds settled bid/KYC content, the most sensitive material
+// in the vetting module.
+router.get('/vetting-bids/:id/decided-record', readLimiter, ...authRequired('admin'), async (req, res, next) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isFinite(id)) return res.status(400).json({ success: false, error: 'Invalid record id' });
@@ -413,11 +329,14 @@ router.get('/vetting-bids/:id/decided-record', readLimiter, async (req, res, nex
     const record = await VettingDecidedRecord.findByPk(id);
     if (!record) return res.status(404).json({ success: false, error: 'Record not found' });
 
-    logger.info({ reqId: req.requestId, recordId: id, vettingBidId: record.vettingBidId, envelope: record.envelope }, '[VETTING] decided record accessed');
+    logger.info(
+      { reqId: req.requestId, recordId: id, vettingBidId: record.vettingBidId, envelope: record.envelope, requestedBy: req.org!.id },
+      '[VETTING] decided record accessed'
+    );
 
     res.json({ success: true, envelope: record.envelope, decidedAt: record.decidedAt });
-    // Content deliberately not decrypted/returned yet — see the auth note above. This endpoint's
-    // shape is in place; the decrypt-and-return step is gated on real auth existing first.
+    // Content still deliberately not decrypted/returned — this endpoint's shape is in place, but
+    // returning the actual reviewed content is a separate follow-up, not gated on auth anymore.
   } catch (err) {
     next(err);
   }

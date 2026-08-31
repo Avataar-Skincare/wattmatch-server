@@ -32,6 +32,16 @@ export class VettingBid extends Model<InferAttributes<VettingBid>, InferCreation
   // envelope decrypted — a rejected generator's financial envelope is never decrypted, full stop.
   declare technicalStatus: CreationOptional<TechnicalStatus>;
 
+  // Written once by routes/vettingCustodian.ts's POST /ceremony/complete — the plaintext a custodian
+  // ceremony revealed, encrypted via fieldEncryption.ts (KMS-based; a different mechanism from the
+  // custodian scheme itself, same distinction VettingDecidedRecord's own comment draws: this is an
+  // access-control problem for admin review, not a custodian-consent problem). Deliberately NOT the
+  // same as VettingDecidedRecord, which stays "populated only after a decision" — this is the
+  // in-between "opened, awaiting admin's decision" state admin reads via GET
+  // /vetting-bids/:tenderRef/opened/:envelope to copy into technical-decision's reviewedContent.
+  declare technicalOpenedContent: string | null;
+  declare financialOpenedContent: string | null;
+
   declare readonly createdAt: CreationOptional<Date>;
 }
 
@@ -53,6 +63,9 @@ VettingBid.init(
     financialCiphertextHash: { type: DataTypes.STRING, allowNull: false },
 
     technicalStatus: { type: DataTypes.ENUM('pending', 'approved', 'rejected'), allowNull: false, defaultValue: 'pending' },
+
+    technicalOpenedContent: { type: DataTypes.TEXT, allowNull: true },
+    financialOpenedContent: { type: DataTypes.TEXT, allowNull: true },
 
     createdAt: DataTypes.DATE,
   },

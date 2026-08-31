@@ -15,6 +15,11 @@ export class AuctionParticipant extends Model<InferAttributes<AuctionParticipant
   // either automatically, so a plaintext value can't accidentally slip in through a code path that
   // forgot to encrypt it.
   declare organizationName: string;
+  // Real Organization backing this seat — null only for the manual/PoC seed route (auctionAdmin.ts's
+  // /auctions/seed), which has no real org to bind to. Non-null for every participant created by the
+  // real promote-to-auction flow (vettingAuctionBridge.ts) — this is what routes/auctions.ts's join
+  // endpoint looks up to confirm a logged-in org actually holds this seat.
+  declare organizationId: number | null;
   declare alias: string;
   // 'buyer' is a read-only spectator seat — same alias-only exposure and join-token mechanism as a
   // generator, just never allowed to submit a bid (enforced server-side in auctionSocket.ts, not
@@ -35,6 +40,7 @@ AuctionParticipant.init(
     id: { type: DataTypes.INTEGER.UNSIGNED, autoIncrement: true, primaryKey: true },
     auctionId: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false },
     organizationName: { type: DataTypes.TEXT, allowNull: false },
+    organizationId: { type: DataTypes.INTEGER.UNSIGNED, allowNull: true },
     alias: { type: DataTypes.STRING, allowNull: false },
     role: { type: DataTypes.ENUM('generator', 'buyer'), allowNull: false, defaultValue: 'generator' },
     joinTokenId: { type: DataTypes.STRING, allowNull: false, unique: true },

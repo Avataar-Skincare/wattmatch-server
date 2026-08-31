@@ -123,26 +123,27 @@ router.post('/ci', async (req, res) => {
     // submit a TenderRequest for an admin to price and convert. A buyer arriving through this
     // marketing form would otherwise never see that step at all, so this creates one automatically
     // from the demand-sizing fields the form already collects, landing it straight in the admin's
-    // "Pending tender requests" queue. Skipped when targetCapacity is blank — already validated
-    // above (line ~99) when present, so no re-check needed here — there's no sensible MW figure to
-    // invent for a tender-sizing document. Best-effort: a failure here shouldn't turn an otherwise
-    // successful registration into an error response.
-    if (targetCapacity) {
-      try {
-        const detailParts: string[] = [];
-        if (load) detailParts.push(`Monthly consumption: ${load} kWh`);
-        if (siteLocation) detailParts.push(`Site location: ${siteLocation}`);
-        if (tenurePreference) detailParts.push(`Preferred tenure: ${tenurePreference} years`);
-        if (message) detailParts.push(message);
-        await TenderRequest.create({
-          buyerOrgId: org.id,
-          title: `Tender request from ${company || name || email}`,
-          requiredCapacityMw: String(targetCapacity),
-          requirementsDetail: detailParts.length ? detailParts.join('\n') : null,
-        });
-      } catch (err) {
-        console.error(`Failed to auto-create tender request for CI registration ${registration.id}:`, err);
-      }
+    // "Pending tender requests" queue — always, even with no target capacity given (stored as '0',
+    // a value no real tender ever has since AdminConsolePage's capacity field requires a positive
+    // number): admin fills that in themselves at conversion time regardless of source, the same as
+    // every other TenderRequest field they're free to edit before posting, so there's no reason to
+    // leave a registration stranded with no path to becoming a tender just because this one field
+    // was left blank. Best-effort: a failure here shouldn't turn an otherwise successful
+    // registration into an error response.
+    try {
+      const detailParts: string[] = [];
+      if (load) detailParts.push(`Monthly consumption: ${load} kWh`);
+      if (siteLocation) detailParts.push(`Site location: ${siteLocation}`);
+      if (tenurePreference) detailParts.push(`Preferred tenure: ${tenurePreference} years`);
+      if (message) detailParts.push(message);
+      await TenderRequest.create({
+        buyerOrgId: org.id,
+        title: `Tender request from ${company || name || email}`,
+        requiredCapacityMw: targetCapacity ? String(targetCapacity) : '0',
+        requirementsDetail: detailParts.length ? detailParts.join('\n') : null,
+      });
+    } catch (err) {
+      console.error(`Failed to auto-create tender request for CI registration ${registration.id}:`, err);
     }
 
     res.status(201).json({ success: true, message: 'CI registration saved successfully', id: registration.id, createdAt: registration.createdAt });

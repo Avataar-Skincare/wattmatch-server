@@ -43,6 +43,15 @@ async function patch(path: string, body: unknown, token?: string) {
   return { status: res.status, body: await res.json() };
 }
 
+async function post(path: string, body: unknown, token?: string) {
+  const res = await fetch(`${baseUrl}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(body),
+  });
+  return { status: res.status, body: await res.json() };
+}
+
 describe('GET/PATCH /organizations/me', () => {
   it('rejects with no token', async () => {
     const res = await get('/api/organizations/me');
@@ -93,5 +102,46 @@ describe('GET/PATCH /organizations/me', () => {
     expect(res.body.organization.name).toBe('Partial Update'); // unchanged
     expect(res.body.organization.contactPhone).toBe('9000000003'); // unchanged
     expect(res.body.organization.capacityMw).toBe('7');
+  });
+});
+
+describe('POST /organizations/admin-invite', () => {
+  it('rejects with no token', async () => {
+    const res = await post('/api/organizations/admin-invite', { name: 'New Admin', email: `invitee-${Date.now()}@test.local`, phone: '9000000010' });
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects a non-admin caller', async () => {
+    const gen = await Organization.create({ type: 'generator', name: 'Not An Admin', contactEmail: `not-admin-${Date.now()}@test.local`, contactPhone: '9000000011' });
+    createdOrgIds.push(gen.id);
+    const token = await signOrgToken({ organizationId: gen.id, type: 'generator' });
+
+    const res = await post('/api/organizations/admin-invite', { name: 'New Admin', email: `invitee-${Date.now()}@test.local`, phone: '9000000012' }, token);
+    expect(res.status).toBe(403);
+  });
+
+  it('lets an admin create another admin, passwordless, pending a set-password email', async () => {
+    const admin = await Organization.create({ type: 'admin', name: 'Existing Admin', contactEmail: `existing-admin-${Date.now()}@test.local`, contactPhone: '9000000013' });
+    createdOrgIds.push(admin.id);
+    const token = await signOrgToken({ organizationId: admin.id, type: 'admin' });
+
+    const email = `invitee-${Date.now()}@test.local`;
+    const res = await post('/api/organizations/admin-invite', { name: 'Invited Admin', email, phone: '9000000014' }, token);
+    expect(res.status).toBe(200);
+    createdOrgIds.push(res.body.organizationId);
+
+    const created = await Organization.findByPk(res.body.organizationId);
+    expect(created!.type).toBe('admin');
+    expect(created!.contactEmail).toBe(email);
+    expect(created!.passwordHash).toBeNull();
+  });
+
+  it('rejects inviting an email that already has an account', async () => {
+    const admin = await Organization.create({ type: 'admin', name: 'Existing Admin 2', contactEmail: `existing-admin-2-${Date.now()}@test.local`, contactPhone: '9000000015' });
+    createdOrgIds.push(admin.id);
+    const token = await signOrgToken({ organizationId: admin.id, type: 'admin' });
+
+    const res = await post('/api/organizations/admin-invite', { name: 'Duplicate', email: admin.contactEmail, phone: '9000000016' }, token);
+    expect(res.status).toBe(409);
   });
 });

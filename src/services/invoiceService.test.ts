@@ -3,7 +3,7 @@ import { Tender } from '../models/Tender.js';
 import { Organization } from '../models/Organization.js';
 import { Payment, type PaymentPurpose } from '../models/Payment.js';
 import { Invoice } from '../models/Invoice.js';
-import { generateInvoiceForPayment } from './invoiceService.js';
+import { generateInvoiceForPayment, generateMissingInvoices } from './invoiceService.js';
 import { readObject } from '../lib/s3.js';
 
 // AWS_S3_BUCKET is intentionally unset in this test env, so uploadObject/readObject exercise the
@@ -108,5 +108,32 @@ describe('generateInvoiceForPayment', () => {
     const invoice = await generateInvoiceForPayment(payment);
     expect(invoice!.buyerName).toBe('Org-Linked Buyer');
     expect(invoice!.buyerEmail).toBe(buyer.contactEmail);
+  });
+});
+
+// Regression coverage for the self-healing fix: paymentStateMachine.ts's fire-and-forget call to
+// generateInvoiceForPayment previously had no retry at all if it failed once — this is what catches
+// that on the next check interval.
+describe('generateMissingInvoices', () => {
+  it('generates an invoice for a paid payment that never got one', async () => {
+    const payment = await makePaidPayment();
+    expect(await Invoice.findOne({ where: { paymentId: payment.id } })).toBeNull();
+
+    await generateMissingInvoices();
+
+    const invoice = await Invoice.findOne({ where: { paymentId: payment.id } });
+    expect(invoice).not.toBeNull();
+  });
+
+  it('does not duplicate an invoice for a payment that already has one', async () => {
+    const payment = await makePaidPayment();
+    const first = await generateInvoiceForPayment(payment);
+
+    await generateMissingInvoices();
+
+    const count = await Invoice.count({ where: { paymentId: payment.id } });
+    expect(count).toBe(1);
+    const invoice = await Invoice.findOne({ where: { paymentId: payment.id } });
+    expect(invoice!.id).toBe(first!.id);
   });
 });

@@ -1,13 +1,14 @@
 import { Router } from 'express';
-import rateLimit from 'express-rate-limit';
+import { jsonRateLimit as rateLimit } from '../lib/rateLimit.js';
 import { z } from 'zod';
 import { Auction } from '../models/Auction.js';
 import { AuctionParticipant } from '../models/AuctionParticipant.js';
 import { AuctionBid } from '../models/AuctionBid.js';
-import { generateJti, signJoinToken, verifyJoinToken } from '../lib/auctionTokens.js';
+import { generateJti, signJoinToken } from '../lib/auctionTokens.js';
 import { initAuctionState, startAuctionClock, MIN_UNDERCUT, MAX_BID_AMOUNT } from '../services/auctionEngine.js';
-import { encryptField, decryptField } from '../lib/fieldEncryption.js';
+import { encryptField } from '../lib/fieldEncryption.js';
 import { logger } from '../lib/logger.js';
+import { authRequired } from '../middleware/auth.js';
 
 const router = Router();
 
@@ -40,6 +41,15 @@ export const seedBodySchema = z
     openingBid: z.number().positive().max(MAX_BID_AMOUNT, `openingBid must be at most ${MAX_BID_AMOUNT}`),
     windowSeconds: z.number().int().positive().max(MAX_WINDOW_SECONDS, `windowSeconds must be at most ${MAX_WINDOW_SECONDS}`).default(480),
     maxAutoExtensions: z.number().int().min(0).max(MAX_AUTO_EXTENSIONS_CAP, `maxAutoExtensions must be at most ${MAX_AUTO_EXTENSIONS_CAP}`).default(8),
+    // Per-auction switch: landed-rate (equityValue/totalUnitsPerYear required, see below) vs a
+    // normal-rate auction (a single rate, lowest wins — today's original behavior).
+    useLandedRate: z.boolean(),
+    // Landed-rate formula inputs (see auctionEngine.ts's computeLandedRate) — only required when
+    // useLandedRate is true (enforced by the .superRefine below); a manually-seeded demo auction
+    // has no Tender to source them from (contrast with vettingAuctionBridge.ts's promotion path,
+    // which reads them off the tender instead).
+    equityValue: z.number().positive('equityValue must be a positive number').optional(),
+    totalUnitsPerYear: z.number().positive('totalUnitsPerYear must be a positive number').optional(),
     participants: z.array(seedParticipantSchema).min(1, 'at least one participant is required'),
     // Optional — a real listing always has one, but plenty of PoC/demo runs don't need a spectator
     // seat at all. A buyer is otherwise seated exactly like a generator (same join-token mechanism,
@@ -55,18 +65,25 @@ export const seedBodySchema = z
       return new Set(aliases).size === aliases.length;
     },
     { message: 'Participant (and buyer) aliases must be unique within an auction', path: ['participants'] }
-  );
+  )
+  .superRefine((data, ctx) => {
+    if (!data.useLandedRate) return;
+    if (data.equityValue === undefined) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'equityValue is required for a landed-rate auction', path: ['equityValue'] });
+    }
+    if (data.totalUnitsPerYear === undefined) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'totalUnitsPerYear is required for a landed-rate auction', path: ['totalUnitsPerYear'] });
+    }
+  });
 
-// These routes have no auth in front of them (see each route's own comment) — rate limiting is
-// the one cheap thing that bounds how much damage that allows: it can't stop a determined caller,
-// but it stops both routes from being trivially scriptable into a bulk-create or bulk-scrape tool.
-// Keyed on IP by default (express-rate-limit's standard keyGenerator), which is enough for a PoC
-// with no real user identity to key on yet. NOTE: this keys on req.ip, which resolves correctly
-// on localhost today but will bucket every caller under one shared IP once this sits behind
-// CloudFront/an ALB in production — at that point `app.set('trust proxy', ...)` needs to be set to
-// the real hop count so req.ip reads the client's actual IP from X-Forwarded-For instead of the
-// proxy's. Not set now because guessing the wrong hop count would let a caller spoof their way
-// around the limit, which is worse than the limit being coarse in the meantime.
+// seed/export are admin-only (see their own comments) but still rate-limited on top of that — a
+// compromised or careless admin credential shouldn't be able to bulk-create or bulk-scrape either
+// route without limit. Keyed on IP by default (express-rate-limit's standard keyGenerator) — set via
+// TRUST_PROXY_HOPS (see index.ts) once this sits behind CloudFront/an ALB, so req.ip reads the
+// client's actual IP from X-Forwarded-For instead of the proxy's.
+//
+// Participant-facing auction routes (join, winner-identity) live in routes/auctions.ts, not here —
+// this file is admin-only auction management.
 const seedLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 20,
@@ -81,18 +98,12 @@ const exportLimiter = rateLimit({
   legacyHeaders: false,
   message: { success: false, error: 'Too many export requests from this IP — try again shortly.' },
 });
-const identityRevealLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  limit: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { success: false, error: 'Too many identity-reveal requests from this IP — try again shortly.' },
-});
 
 // PoC-only seed endpoint — stands in for the real enrollment flow (which will source eligible
-// generators from the matching engine in MARKETPLACE_PLAN.md). No auth, matches this project's
-// existing authless-admin-route pattern; not something to expose on the real platform.
-router.post('/auctions/seed', seedLimiter, async (req, res, next) => {
+// generators from the matching engine in MARKETPLACE_PLAN.md), kept around as an admin manual-
+// override alongside the real vetting-to-auction promotion path (vettingAuctionBridge.ts).
+// Admin-only, same as every other route that creates real auction state.
+router.post('/auctions/seed', seedLimiter, ...authRequired('admin'), async (req, res, next) => {
   // Express 4 does not catch a rejected promise from an async handler on its own — without this,
   // any DB error below (bad input that still passes the checks, a constraint violation, a
   // transient connection blip) becomes an unhandled rejection and crashes the whole process,
@@ -103,7 +114,7 @@ router.post('/auctions/seed', seedLimiter, async (req, res, next) => {
     if (!parsed.success) {
       return res.status(400).json({ success: false, error: parsed.error.issues.map((issue) => issue.message).join('; ') });
     }
-    const { title, openingBid, windowSeconds, maxAutoExtensions, participants, buyer } = parsed.data;
+    const { title, openingBid, windowSeconds, maxAutoExtensions, useLandedRate, equityValue, totalUnitsPerYear, participants, buyer } = parsed.data;
 
     // minUndercut is intentionally NOT accepted from the request body — it's a flat platform rule
     // (AUCTION_PLAN.md), not something a seed caller gets to configure per auction. Snapshotting the
@@ -123,9 +134,12 @@ router.post('/auctions/seed', seedLimiter, async (req, res, next) => {
       windowSeconds,
       maxAutoExtensions,
       minUndercut: String(MIN_UNDERCUT),
+      useLandedRate,
+      equityValue: equityValue !== undefined ? String(equityValue) : null,
+      totalUnitsPerYear: totalUnitsPerYear !== undefined ? String(totalUnitsPerYear) : null,
     });
 
-    await initAuctionState(auction.id, openingBid, windowSeconds, maxAutoExtensions, MIN_UNDERCUT);
+    await initAuctionState(auction.id, openingBid, windowSeconds, maxAutoExtensions, MIN_UNDERCUT, useLandedRate, equityValue, totalUnitsPerYear);
 
     // Falls back to localhost silently — fine for local dev, but if CORS_ORIGIN is ever missed in
     // a real deployment this would still return 200 OK with join links that look valid but point
@@ -186,9 +200,9 @@ router.post('/auctions/seed', seedLimiter, async (req, res, next) => {
     const windowEndsAt = await startAuctionClock(auction.id, windowSeconds);
     await Auction.update({ status: 'live' }, { where: { id: auction.id } });
 
-    // Privileged-action logging: this route creates real auction state with no auth in front of
-    // it, so at minimum every call should leave a trace of who/when/what — see the "Identity,
-    // authentication and access" checklist. Full RBAC/audit trail is deferred, but this is cheap.
+    // Privileged-action logging: this route creates real auction state, so every call should still
+    // leave a trace of who/when/what beyond just "an admin token was presented" — cheap, and useful
+    // even with authRequired('admin') above (e.g. correlating a specific admin's activity).
     logger.info(
       { reqId: req.requestId, auctionId: auction.id, title, participantCount: participants.length, buyerAlias: buyer?.alias ?? null, ip: req.ip },
       'auction seeded'
@@ -202,8 +216,9 @@ router.post('/auctions/seed', seedLimiter, async (req, res, next) => {
 
 // Evidence-export control: lets a customer or auditor pull the full, verifiable record for a
 // closed (or in-progress) auction — the hash-chained bid log plus the signed result summary.
-// No auth, same as the rest of this file — not something to expose on the real platform as-is.
-router.get('/auctions/:id/export', exportLimiter, async (req, res, next) => {
+// Admin-only — this is the highest-value insider position while an auction is still live (see the
+// redaction logic below), so it's gated the same as auction creation above.
+router.get('/auctions/:id/export', exportLimiter, ...authRequired('admin'), async (req, res, next) => {
   try {
     const auctionId = Number(req.params.id);
     // A non-numeric :id (e.g. /auctions/abc/export) makes this NaN — reject before it reaches a
@@ -216,9 +231,10 @@ router.get('/auctions/:id/export', exportLimiter, async (req, res, next) => {
 
     // organizationName is deliberately excluded — it's encrypted at rest specifically because the
     // live protocol's identity-hiding property (alias-only exposure) shouldn't be undermined by an
-    // export route returning the real name right back out. This route has no auth in front of it
-    // (see its own comment), so there's no legitimate caller to decrypt it for here; a real
-    // "reveal winner's identity" flow needs actual admin/buyer auth first — not built yet.
+    // export route returning the real name right back out. Even with admin auth in front of this
+    // route now, decrypting it here still isn't the right flow — the dedicated winner-identity
+    // route above is the one legitimate reveal path, scoped to the actual winner/buyer, not "any
+    // admin looking at any auction's export."
     const participants = await AuctionParticipant.findAll({
       where: { auctionId },
       attributes: ['id', 'alias', 'role', 'rulesAcceptedAt', 'createdAt'],
@@ -226,19 +242,24 @@ router.get('/auctions/:id/export', exportLimiter, async (req, res, next) => {
     const bids = await AuctionBid.findAll({
       where: { auctionId },
       order: [['id', 'ASC']],
-      attributes: ['id', 'alias', 'amount', 'accepted', 'rejectReason', 'ipHash', 'prevHash', 'hash', 'createdAt'],
+      attributes: ['id', 'alias', 'amount', 'rate', 'returnPercent', 'accepted', 'rejectReason', 'ipHash', 'prevHash', 'hash', 'createdAt'],
     });
 
     // While an auction is still live, this endpoint is the highest-value insider position in the
-    // whole system: anyone with access to it (this route has no auth) sees the real-time leading
-    // rate and could feed it straight to a colluding generator. Redact the rate itself — not the
-    // rest of the record — until the auction closes, so integrity (hash chain, timestamps, who bid)
-    // stays fully inspectable at any time, but the one thing worth leaking early can't leak.
+    // whole system: even an admin with legitimate access to it sees the real-time leading rate and
+    // could (deliberately or via a compromised credential) feed it straight to a colluding
+    // generator. Redact the rate itself — not the rest of the record — until the auction closes, so
+    // integrity (hash chain, timestamps, who bid) stays fully inspectable at any time, but the one
+    // thing worth leaking early can't leak, regardless of who's calling this. rate/returnPercent
+    // (the raw inputs behind the landed rate in `amount`) are redacted the same way, for the same
+    // reason.
     const isLive = auction.status === 'live';
     const bidsOut = bids.map((b) => ({
       id: b.id,
       alias: b.alias,
       amount: isLive ? null : b.amount,
+      rate: isLive ? null : b.rate,
+      returnPercent: isLive ? null : b.returnPercent,
       accepted: b.accepted,
       rejectReason: b.rejectReason,
       ipHash: b.ipHash,
@@ -248,8 +269,8 @@ router.get('/auctions/:id/export', exportLimiter, async (req, res, next) => {
     }));
 
     // Privileged-action logging: this route can reveal the full bid chain and result summary for
-    // any auction, with no auth in front of it — every call should leave a trace, same as the seed
-    // route already does.
+    // any auction — every call should leave a trace of exactly which admin accessed it, same as
+    // the seed route already does.
     logger.info({ reqId: req.requestId, auctionId, status: auction.status, ip: req.ip }, 'auction export accessed');
 
     res.json({
@@ -262,6 +283,8 @@ router.get('/auctions/:id/export', exportLimiter, async (req, res, next) => {
         openingBid: auction.openingBid,
         currentLowestBid: isLive ? null : auction.currentLowestBid,
         minUndercut: auction.minUndercut,
+        equityValue: auction.equityValue,
+        totalUnitsPerYear: auction.totalUnitsPerYear,
         winnerParticipantId: auction.winnerParticipantId,
         resultSummary: auction.resultSummaryJson ? JSON.parse(auction.resultSummaryJson) : null,
         resultHash: auction.resultHash,
@@ -274,110 +297,8 @@ router.get('/auctions/:id/export', exportLimiter, async (req, res, next) => {
   }
 });
 
-// Winning-pair identity reveal (see LIVE_AUCTION_IDENTITY_ENCRYPTION_PLAN.md's "follow-up" and
-// BID_SEALING_BUILD_CHECKLIST.md's C.5: "Auto-reveal of identity for the winning pair only, on
-// auction close. Losing bidders' identities remain sealed post-auction."). This is the one
-// legitimate reason organizationName ever needs to be decrypted: the buyer needs the winning
-// generator's real company to execute a PPA, and the winner needs to know who they're contracting
-// with. Everyone else — losing generators, anyone without a token at all — gets nothing.
-//
-// There's no admin/user auth system yet (same gap as every other route in this file), so this
-// can't be gated behind a real role check. Instead of leaving it unbuilt until that exists, it
-// reuses the one piece of identity proof that already exists: a participant's own join token
-// (the same JWT already handed to them for socket auth) proves who they are without needing a
-// separate login system. A caller without a valid token for this specific auction gets nothing,
-// and a caller who has a valid token but isn't the winner or the buyer also gets nothing — only
-// the two counterparties who actually need to contract with each other can ever see this.
-router.get('/auctions/:id/winner-identity', identityRevealLimiter, async (req, res, next) => {
-  try {
-    const auctionId = Number(req.params.id);
-    if (!Number.isFinite(auctionId)) {
-      return res.status(400).json({ success: false, error: 'Invalid auction id' });
-    }
-
-    const authHeader = req.headers.authorization;
-    const token = authHeader?.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : undefined;
-    if (!token) {
-      return res.status(401).json({ success: false, error: 'Missing join token' });
-    }
-
-    let payload;
-    try {
-      // Expiry deliberately ignored here (unlike the live socket auth path) — this route is only
-      // ever reachable post-close, potentially days after the 24h live window ends, and a buyer or
-      // winner legitimately needing to execute a contract shouldn't be permanently locked out just
-      // because they didn't act within a day. Safe to relax specifically here because the
-      // requester's identity is still independently re-checked against a live AuctionParticipant
-      // row below (id/auctionId/jti must all still match) — an expired-but-otherwise-genuine token
-      // proves the same thing a fresh one would; a forged or tampered one still fails verification.
-      payload = await verifyJoinToken(token, { ignoreExpiration: true });
-    } catch (err) {
-      logger.warn({ reqId: req.requestId, auctionId, err }, '[AUCTION_IDENTITY] rejected: invalid token');
-      return res.status(401).json({ success: false, error: 'Invalid join token' });
-    }
-    if (payload.auctionId !== auctionId) {
-      return res.status(403).json({ success: false, error: 'This token does not belong to this auction' });
-    }
-
-    const auction = await Auction.findByPk(auctionId);
-    if (!auction) return res.status(404).json({ success: false, error: 'Auction not found' });
-    // Checked before looking up the requester so a losing generator can't use timing/error-shape
-    // differences to learn anything about the auction's outcome before it's actually final.
-    if (auction.status !== 'closed') {
-      return res.status(409).json({ success: false, error: 'Identity reveal is only available after the auction closes' });
-    }
-    if (!auction.winnerParticipantId) {
-      return res.status(404).json({ success: false, error: 'This auction closed with no winner' });
-    }
-
-    // joinTokenId check mirrors auctionSocket.ts's own auth middleware exactly — same reasoning:
-    // confirms this is a real, still-valid participant record, not just a structurally-valid JWT.
-    const requester = await AuctionParticipant.findOne({
-      where: { id: payload.participantId, auctionId, joinTokenId: payload.jti },
-    });
-    if (!requester) {
-      return res.status(401).json({ success: false, error: 'Unknown or revoked join token' });
-    }
-
-    const isWinner = requester.id === auction.winnerParticipantId;
-    const isBuyer = requester.role === 'buyer';
-    if (!isWinner && !isBuyer) {
-      logger.warn(
-        { reqId: req.requestId, auctionId, requesterParticipantId: requester.id, requesterRole: requester.role },
-        '[AUCTION_IDENTITY] rejected: requester is neither the winner nor the buyer'
-      );
-      return res.status(403).json({ success: false, error: 'Only the winning generator and the buyer can reveal identity for this auction' });
-    }
-
-    const counterparty = isWinner
-      ? await AuctionParticipant.findOne({ where: { auctionId, role: 'buyer' } })
-      : await AuctionParticipant.findOne({ where: { id: auction.winnerParticipantId } });
-    if (!counterparty) {
-      // A generator-only auction (no buyer seat) has nothing for the winner to reveal — not an
-      // error in the auction itself, just nothing to return here.
-      return res.status(404).json({ success: false, error: 'No counterparty to reveal (this auction had no buyer seat)' });
-    }
-
-    const organizationName = await decryptField(counterparty.organizationName);
-
-    // Privileged-action logging, same convention as seed/export — this is the one route in the
-    // whole module that ever turns encrypted identity back into plaintext, so every call is worth
-    // a permanent trace of exactly who saw whose identity and when.
-    logger.info(
-      {
-        reqId: req.requestId,
-        auctionId,
-        requesterParticipantId: requester.id,
-        requesterRole: requester.role,
-        revealedParticipantId: counterparty.id,
-      },
-      '[AUCTION_IDENTITY] winning-pair identity revealed'
-    );
-
-    res.json({ success: true, alias: counterparty.alias, organizationName });
-  } catch (err) {
-    next(err);
-  }
-});
+// Winning-pair identity reveal moved to routes/auctions.ts (GET /auctions/:id/winner-identity) — it
+// now authenticates via a real org login (with a legacy join-token fallback for the manual-seed
+// path above), not a bearer token embedded in the join link. See that file's own comments.
 
 export default router;

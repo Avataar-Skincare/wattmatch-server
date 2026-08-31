@@ -18,6 +18,7 @@ import {
   RESULT_DISCLOSURE,
   MAX_BID_AMOUNT,
   sanitizeAmountForAudit,
+  sanitizePercentForAudit,
 } from '../services/auctionEngine.js';
 
 // Single recurring poll, not a per-bid setTimeout reschedule — avoids Node event-loop-lag drift
@@ -74,7 +75,7 @@ interface AuctionSocketData {
 
 export function setupAuctionSocket(httpServer: HTTPServer) {
   const io = new SocketIOServer<
-    { 'bid:new': (payload: { amount: number }) => void; 'rules:accept': () => void },
+    { 'bid:new': (payload: { rate: number; returnPercent: number }) => void; 'rules:accept': () => void },
     {
       'state:sync': (state: unknown) => void;
       'you:info': (payload: { alias: string; role: AuctionParticipantRole; rulesAccepted: boolean }) => void;
@@ -169,49 +170,58 @@ export function setupAuctionSocket(httpServer: HTTPServer) {
     const room = `auction:${auctionId}`;
     const sessionKey = sessionKeyFor(auctionId, participantId);
 
-    // Take over any existing session for this same participant before doing anything else — the
-    // old tab/device is told why it's being cut off, then force-disconnected. Using io.to/io.in
-    // (not a local socket lookup) so this still works if the old socket happens to be connected to
-    // a different server instance behind the Redis adapter.
-    const previousSocketId = activeSessionByParticipant.get(sessionKey);
-    if (previousSocketId && previousSocketId !== socket.id) {
+    // Everything below can throw (Redis, the session-takeover broadcast, room join) — without this,
+    // an unhandled rejection here crashes the whole process (Node terminates on unhandled rejection
+    // by default, and there's no global handler), taking down every other live auction along with
+    // it, not just this one connection. Same reasoning already applied to rules:accept/bid:new below.
+    try {
+      // Take over any existing session for this same participant before doing anything else — the
+      // old tab/device is told why it's being cut off, then force-disconnected. Using io.to/io.in
+      // (not a local socket lookup) so this still works if the old socket happens to be connected to
+      // a different server instance behind the Redis adapter.
+      const previousSocketId = activeSessionByParticipant.get(sessionKey);
+      if (previousSocketId && previousSocketId !== socket.id) {
+        logger.info(
+          { auctionId, participantId, alias: socket.data.alias, oldSocketId: previousSocketId, newSocketId: socket.id },
+          '[AUCTION_SESSION] session replaced'
+        );
+        io.to(previousSocketId).emit('session:replaced');
+        io.in(previousSocketId).disconnectSockets(true);
+      }
+      activeSessionByParticipant.set(sessionKey, socket.id);
+
+      // Tagged with the stable identity (participant/alias), not just the ephemeral socket.id, so a
+      // log search for one participant shows every connect/disconnect across however many times they
+      // reconnected — the socket.id is a new random value every time and useless for that on its own.
       logger.info(
-        { auctionId, participantId, alias: socket.data.alias, oldSocketId: previousSocketId, newSocketId: socket.id },
-        '[AUCTION_SESSION] session replaced'
+        { socketId: socket.id, auctionId, participantId, alias: socket.data.alias, role: socket.data.role, ip: socket.handshake.address },
+        '[AUCTION_SESSION] connected'
       );
-      io.to(previousSocketId).emit('session:replaced');
-      io.in(previousSocketId).disconnectSockets(true);
-    }
-    activeSessionByParticipant.set(sessionKey, socket.id);
 
-    // Tagged with the stable identity (participant/alias), not just the ephemeral socket.id, so a
-    // log search for one participant shows every connect/disconnect across however many times they
-    // reconnected — the socket.id is a new random value every time and useless for that on its own.
-    logger.info(
-      { socketId: socket.id, auctionId, participantId, alias: socket.data.alias, role: socket.data.role, ip: socket.handshake.address },
-      '[AUCTION_SESSION] connected'
-    );
+      await socket.join(room);
 
-    await socket.join(room);
+      // On connect or reconnect, push current state from Redis — the source of truth, so a
+      // dropped-and-reconnected client just re-syncs with no special-case logic.
+      const state = await getAuctionState(auctionId);
+      socket.emit('state:sync', state);
+      socket.emit('you:info', { alias: socket.data.alias, role: socket.data.role, rulesAccepted: socket.data.rulesAccepted });
 
-    // On connect or reconnect, push current state from Redis — the source of truth, so a
-    // dropped-and-reconnected client just re-syncs with no special-case logic.
-    const state = await getAuctionState(auctionId);
-    socket.emit('state:sync', state);
-    socket.emit('you:info', { alias: socket.data.alias, role: socket.data.role, rulesAccepted: socket.data.rulesAccepted });
-
-    // A (re)join after the auction already closed would otherwise never see the winner summary —
-    // the real 'auction:closed' broadcast is a one-time event sent only to whoever was connected at
-    // the exact moment it fired. Replaying it privately to just this socket reuses the client's
-    // existing handler as-is (no frontend change needed) instead of leaving a late joiner stuck
-    // looking at a "closed" status with no result shown.
-    if (state?.status === 'closed') {
-      socket.emit('auction:closed', {
-        winnerAlias: state.leaderAlias,
-        winningBid: state.currentBid,
-        resultType: RESULT_TYPE,
-        disclosure: RESULT_DISCLOSURE,
-      });
+      // A (re)join after the auction already closed would otherwise never see the winner summary —
+      // the real 'auction:closed' broadcast is a one-time event sent only to whoever was connected at
+      // the exact moment it fired. Replaying it privately to just this socket reuses the client's
+      // existing handler as-is (no frontend change needed) instead of leaving a late joiner stuck
+      // looking at a "closed" status with no result shown.
+      if (state?.status === 'closed') {
+        socket.emit('auction:closed', {
+          winnerAlias: state.leaderAlias,
+          winningBid: state.currentBid,
+          resultType: RESULT_TYPE,
+          disclosure: RESULT_DISCLOSURE,
+        });
+      }
+    } catch (err) {
+      logger.error({ socketId: socket.id, auctionId, participantId, err }, '[AUCTION_SESSION] failed to complete connection setup');
+      return;
     }
 
     // Participant acknowledgement control: bidding is gated on this, not just a UI formality —
@@ -236,7 +246,8 @@ export function setupAuctionSocket(httpServer: HTTPServer) {
 
     socket.on('bid:new', async (payload) => {
       const { auctionId, participantId, alias } = socket.data;
-      const amount = Number(payload?.amount);
+      const rate = Number(payload?.rate);
+      const returnPercent = Number(payload?.returnPercent);
       const ipHash = await hashIp(socket.handshake.address);
 
       // Everything below can throw (a DB write, Redis) — without this, an unhandled rejection in
@@ -273,7 +284,9 @@ export function setupAuctionSocket(httpServer: HTTPServer) {
             auctionId,
             participantId,
             alias,
-            amount: sanitizeAmountForAudit(amount),
+            amount: sanitizeAmountForAudit(rate),
+            rate: sanitizeAmountForAudit(rate),
+            returnPercent: sanitizePercentForAudit(returnPercent),
             accepted: false,
             rejectReason: 'RULES_NOT_ACCEPTED',
             ipHash,
@@ -282,16 +295,18 @@ export function setupAuctionSocket(httpServer: HTTPServer) {
           return;
         }
 
-        // The Lua script only checks a bid is below the current lowest — with no floor or ceiling,
-        // a negative amount would otherwise be accepted as a valid leading bid, and an amount
-        // outside DECIMAL(10,4)'s range would throw on the DB insert below instead of being caught
-        // here cleanly.
-        if (!Number.isFinite(amount) || amount <= 0 || amount > MAX_BID_AMOUNT) {
+        // Same reasoning as before this change, applied to both raw inputs now instead of just one:
+        // with no floor/ceiling here, an invalid rate or an out-of-range return% would otherwise
+        // either be silently accepted or throw on the DB insert below instead of being caught here
+        // cleanly.
+        if (!Number.isFinite(rate) || rate <= 0 || rate > MAX_BID_AMOUNT) {
           await appendAuditedBid({
             auctionId,
             participantId,
             alias,
-            amount: sanitizeAmountForAudit(amount),
+            amount: sanitizeAmountForAudit(rate),
+            rate: sanitizeAmountForAudit(rate),
+            returnPercent: sanitizePercentForAudit(returnPercent),
             accepted: false,
             rejectReason: 'INVALID_AMOUNT',
             ipHash,
@@ -299,14 +314,31 @@ export function setupAuctionSocket(httpServer: HTTPServer) {
           socket.emit('bid:rejected', { reason: 'INVALID_AMOUNT' });
           return;
         }
+        if (!Number.isFinite(returnPercent) || returnPercent < 0 || returnPercent > 100) {
+          await appendAuditedBid({
+            auctionId,
+            participantId,
+            alias,
+            amount: sanitizeAmountForAudit(rate),
+            rate: sanitizeAmountForAudit(rate),
+            returnPercent: sanitizePercentForAudit(returnPercent),
+            accepted: false,
+            rejectReason: 'INVALID_RETURN_PERCENT',
+            ipHash,
+          });
+          socket.emit('bid:rejected', { reason: 'INVALID_RETURN_PERCENT' });
+          return;
+        }
 
-        const result = await submitBid(auctionId, amount, participantId, alias);
+        const result = await submitBid(auctionId, rate, returnPercent, participantId, alias);
 
         await appendAuditedBid({
           auctionId,
           participantId,
           alias,
-          amount: String(amount),
+          amount: String(result.landedRate),
+          rate: String(rate),
+          returnPercent: String(returnPercent),
           accepted: result.accepted,
           rejectReason: result.accepted ? null : result.reason,
           ipHash,

@@ -31,6 +31,14 @@ function buildTransporter() {
 }
 
 function getTransporter() {
+  // Never send a real email under the test runner, even when SMTP is genuinely configured (this
+  // project's vitest.setup.ts loads the same .env the real server uses, specifically so
+  // DB_HOST/REDIS_HOST/etc. work in tests too — that has the side effect of making SMTP_HOST/USER/
+  // PASSWORD available as well). Every sendXxxEmail caller here is fire-and-forget in production
+  // code (`void sendXxxEmail(...)`) — no test asserts on the boolean return value or on a real send
+  // happening — so this only removes real network calls tests never depended on, the same way this
+  // suite already avoids other real external services it doesn't need to actually exercise.
+  if (process.env.VITEST) return null;
   if (transporter) return transporter;
   transporter = buildTransporter();
   return transporter;
@@ -183,6 +191,43 @@ export async function sendAuctionJoinLinkEmail(
   }
 }
 
+// One per (custodian, tender, envelope) — sent when routes/tenders.ts's scheduled
+// technicalBidOpenAt/financialBidOpenAt arrives (or an admin manually resends it). The link itself
+// grants nothing on its own beyond reaching this custodian's ceremony status page — the real secret
+// is the key share only they hold, entered there, never in this email.
+export async function sendCustodianCeremonyLinkEmail(
+  email: string,
+  custodianName: string,
+  tenderId: number,
+  tenderTitle: string,
+  envelope: 'technical' | 'financial',
+  ceremonyUrl: string
+): Promise<boolean> {
+  const client = getTransporter();
+  if (!client) {
+    console.warn(`Custodian ceremony email not configured — skipping send. Ceremony URL for ${email} is ${ceremonyUrl}`);
+    return false;
+  }
+  try {
+    await client.sendMail({
+      from: fromAddress(),
+      to: email,
+      // custodianName in the subject specifically so two custodians' emails for the same tender/
+      // envelope are tellable apart when both land in the same inbox — the dev-mode redirect
+      // (custodianNotificationService.ts) deliberately sends every custodian's link to the same two
+      // test addresses, so without this, two otherwise-identical emails sit side by side with no way
+      // to know which one is whose (see that file's own comment on why).
+      subject: `[${custodianName}] ${envelope === 'technical' ? 'Technical' : 'Financial'} bid opening ceremony: tender #${tenderId} "${tenderTitle}"`,
+      text: `${custodianName} — the ${envelope} bid envelope for tender #${tenderId} ("${tenderTitle}") is ready to open. Enter your custodian key share here: ${ceremonyUrl}\n\nThis link is unique to you — do not share it. It does not by itself decrypt anything; you'll need your own key share to complete the ceremony.`,
+      html: `<p><strong>${custodianName}</strong> — the <strong>${envelope}</strong> bid envelope for tender <strong>#${tenderId}</strong> (<strong>${tenderTitle}</strong>) is ready to open.</p><p>Enter your custodian key share here: <a href="${ceremonyUrl}">${ceremonyUrl}</a></p><p>This link is unique to you — do not share it. It does not by itself decrypt anything; you'll need your own key share to complete the ceremony.</p>`,
+    });
+    return true;
+  } catch (err) {
+    console.error('Custodian ceremony email send failed:', err);
+    return false;
+  }
+}
+
 export async function sendTenderInvitationEmail(email: string, tenderTitle: string, loginUrl: string): Promise<boolean> {
   const client = getTransporter();
   if (!client) {
@@ -226,6 +271,38 @@ export async function sendRegistrationConfirmationEmail(
     return true;
   } catch (err) {
     console.error('Registration confirmation email send failed:', err);
+    return false;
+  }
+}
+
+// Fires once the RfS Document (Bid Purchase) fee is paid — see paymentStateMachine.ts's
+// transitionPayment. Attached as raw bytes rather than a signed S3 link: this purchase is
+// deliberately account-less (rfsDocumentAccessService.ts), so there's no login to come back to if a
+// link-based email is opened after the link's short TTL expires — an attachment never expires. The
+// in-app download (RfsDocumentPurchasePage.tsx's downloadTenderDocument, or GeneratorBidSubmissionPage
+// once enrolled) still works exactly as before; this is a second, durable copy, not a replacement.
+export async function sendTenderDocumentEmail(
+  email: string,
+  tenderTitle: string,
+  attachment: { filename: string; content: Buffer }
+): Promise<boolean> {
+  const client = getTransporter();
+  if (!client) {
+    console.warn(`Tender document email not configured (SMTP_HOST/SMTP_USER/SMTP_PASSWORD) — skipping send to ${email}`);
+    return false;
+  }
+  try {
+    await client.sendMail({
+      from: fromAddress(),
+      to: email,
+      subject: `Your tender document for "${tenderTitle}"`,
+      text: `Thanks for your purchase — the full tender document for "${tenderTitle}" is attached to this email.`,
+      html: `<p>Thanks for your purchase — the full tender document for <strong>${tenderTitle}</strong> is attached to this email.</p>`,
+      attachments: [{ filename: attachment.filename, content: attachment.content }],
+    });
+    return true;
+  } catch (err) {
+    console.error('Tender document email send failed:', err);
     return false;
   }
 }

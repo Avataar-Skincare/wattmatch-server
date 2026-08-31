@@ -1,12 +1,23 @@
 // Demo utility — seeds a reverse-auction and prints ready-to-share join links.
 // There's no admin UI yet (see AUCTION_MVP_PLAN.md), so this replaces typing a raw curl command
 // live in front of an audience. Edit the config below before each demo, then run:
-//   node scripts/seed-demo-auction.mjs                        (talks to localhost:4000)
-//   node scripts/seed-demo-auction.mjs http://192.168.5.18:4000  (talks to a LAN-hosted server —
-//   pass the backend's current LAN IP; it changes between networks/sessions, so re-check it with
-//   `ipconfig`/`Get-NetIPAddress` before each demo rather than assuming this one still applies)
+//   ADMIN_TOKEN=<token> node scripts/seed-demo-auction.mjs                        (localhost:4000)
+//   ADMIN_TOKEN=<token> node scripts/seed-demo-auction.mjs http://192.168.5.18:4000  (a LAN-hosted
+//   server — pass the backend's current LAN IP; it changes between networks/sessions, so re-check it
+//   with `ipconfig`/`Get-NetIPAddress` before each demo rather than assuming this one still applies)
+//
+// /auctions/seed is admin-only (middleware/auth.ts) — get ADMIN_TOKEN by logging in as an admin
+// account (POST /api/organizations/login, created via scripts/create-admin.mjs if none exists yet)
+// and copying the `token` field from the response.
 
 const apiBase = process.argv[2] || 'http://localhost:4000';
+const adminToken = process.env.ADMIN_TOKEN;
+
+if (!adminToken) {
+  console.error('Set ADMIN_TOKEN first — /auctions/seed is admin-only. Log in as an admin (POST /api/organizations/login) and pass its token:');
+  console.error('  ADMIN_TOKEN=<token> node scripts/seed-demo-auction.mjs');
+  process.exit(1);
+}
 
 // --- Edit this block for the actual demo ---
 const config = {
@@ -19,6 +30,12 @@ const config = {
   // purpose, up to 8 times per auction.
   windowSeconds: 300,
   maxAutoExtensions: 8,
+  // Landed-rate formula inputs (see auctionEngine.ts's computeLandedRate) — only required when
+  // useLandedRate is true below. Set useLandedRate: false to demo the original single-rate auction
+  // instead, and drop these two lines entirely.
+  useLandedRate: true,
+  equityValue: 1000000,
+  totalUnitsPerYear: 500000,
   participants: [
     { organizationName: 'Demo Generator One', alias: 'GEN-1' },
     { organizationName: 'Demo Generator Two', alias: 'GEN-2' },
@@ -34,7 +51,7 @@ const config = {
 async function main() {
   const res = await fetch(`${apiBase}/api/auction-admin/auctions/seed`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${adminToken}` },
     body: JSON.stringify(config),
   });
   const result = await res.json();
@@ -57,7 +74,7 @@ async function main() {
     console.log(`  ${result.buyerLink.alias} (${result.buyerLink.organizationName}):\n    ${result.buyerLink.joinUrl}\n`);
   }
 
-  console.log(`Check status / pull the result later:\n  ${apiBase}/api/auction-admin/auctions/${result.auctionId}/export`);
+  console.log(`Check status / pull the result later (admin token required):\n  ${apiBase}/api/auction-admin/auctions/${result.auctionId}/export`);
 }
 
 main().catch((err) => {

@@ -43,6 +43,23 @@ export async function loadSecret(envVarName: string, awsSecretIdEnvVar: string):
   return fetchPromise;
 }
 
+// Same lookup as loadSecret, but for secrets whose absence is a security hole, not a degraded
+// mode — a forged-token risk (JWT signing secrets, HMAC keys) rather than a missing nice-to-have.
+// In production, a caller getting `undefined` back and quietly falling back to a hardcoded default
+// is exactly how ORG_JWT_SECRET went unset in prod undetected; this throws instead, so the process
+// refuses to boot rather than accepting tokens signed with a secret published in this repo's source.
+// Outside production, still returns undefined on a miss — local dev must keep working with zero
+// setup, so callers there keep their own insecure-default fallback (with its existing warn log).
+export async function loadRequiredSecret(envVarName: string, awsSecretIdEnvVar: string): Promise<string | undefined> {
+  const secret = await loadSecret(envVarName, awsSecretIdEnvVar);
+  if (!secret && process.env.NODE_ENV === 'production') {
+    throw new Error(
+      `${envVarName} (or ${awsSecretIdEnvVar}) is not set — refusing to start in production with no real secret configured.`
+    );
+  }
+  return secret;
+}
+
 async function fetchSecret(envVarName: string, awsSecretIdEnvVar: string): Promise<string | undefined> {
   const awsSecretId = process.env[awsSecretIdEnvVar];
   if (process.env.NODE_ENV === 'production' && awsSecretId) {

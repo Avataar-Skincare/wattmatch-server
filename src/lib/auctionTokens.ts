@@ -1,7 +1,7 @@
 import jwt from 'jsonwebtoken';
 import crypto from 'node:crypto';
 import { logger } from './logger.js';
-import { loadSecret } from './secrets.js';
+import { loadRequiredSecret } from './secrets.js';
 
 export interface AuctionTokenPayload {
   auctionId: number;
@@ -21,7 +21,7 @@ export function generateJti(): string {
 // caching here too. The insecure fallback stays as a last resort so local dev never hard-fails with
 // no secret configured at all, but now warns on every use it's active, not just once at import time.
 async function getJwtSecret(): Promise<string> {
-  const secret = await loadSecret('AUCTION_JWT_SECRET', 'AUCTION_JWT_SECRET_ARN');
+  const secret = await loadRequiredSecret('AUCTION_JWT_SECRET', 'AUCTION_JWT_SECRET_ARN');
   if (!secret) {
     logger.warn('AUCTION_JWT_SECRET is not set anywhere — falling back to an insecure dev-only default. Set it before any real test.');
     return 'dev-only-insecure-auction-secret';
@@ -31,35 +31,32 @@ async function getJwtSecret(): Promise<string> {
 
 // jti is generated separately (via generateJti) and stored on AuctionParticipant BEFORE this is
 // called, since the token embeds the participant's DB id — created first, jti reused when signing.
-// 24h expiry — generous relative to how long a PoC auction actually runs (minutes, even with
-// extensions), but bounded rather than forever: previously this had no expiresIn at all, so a
-// leaked join link worked indefinitely despite verifyJoinToken's own comment claiming otherwise.
-export async function signJoinToken(payload: AuctionTokenPayload): Promise<string> {
+// Default 24h expiry is the legacy shape (auctionAdmin.ts's manual /auctions/seed route, which embeds
+// this token directly in an emailed link with no login to fall back on if it expires). The real
+// production join path (routes/auctions.ts) passes a much shorter explicit value — that path re-mints
+// a fresh token from an org login on every join/reconnect (see AuctionLivePage.tsx), so there's no
+// reason for its tokens to outlive a single sitting; a leaked one's replay window shrinks accordingly.
+export async function signJoinToken(
+  payload: AuctionTokenPayload,
+  expiresIn: jwt.SignOptions['expiresIn'] = '24h'
+): Promise<string> {
   const secret = await getJwtSecret();
-  return jwt.sign(payload, secret, { algorithm: 'HS256', expiresIn: '24h' });
+  return jwt.sign(payload, secret, { algorithm: 'HS256', expiresIn });
 }
 
-export async function verifyJoinToken(
-  token: string,
-  options?: { ignoreExpiration?: boolean }
-): Promise<AuctionTokenPayload> {
+// Always strict on expiry now — the one caller that used to need ignoreExpiration (winner-identity,
+// reachable days after a 24h token's natural expiry) now authenticates via the org's durable login
+// session instead of reusing this ephemeral socket token at all (see routes/auctions.ts), so there's
+// no remaining case where an expired-but-genuine token should still be accepted.
+export async function verifyJoinToken(token: string): Promise<AuctionTokenPayload> {
   const secret = await getJwtSecret();
-  // Throws on invalid/tampered tokens (always) or expired ones (unless ignoreExpiration is set) —
-  // callers must catch and reject. ignoreExpiration exists for exactly one caller
-  // (auctionAdmin.ts's winner-identity reveal, post-close, potentially long after the 24h live
-  // window) — the token's signature still has to be genuine either way, and that route
-  // independently re-validates the caller against a live AuctionParticipant row (id/auctionId/jti
-  // must all still match) before revealing anything, so relaxing expiry there doesn't weaken who
-  // can actually get an answer. The live socket path (auctionSocket.ts) never passes this — a
-  // long-lived token actively usable to disrupt a live auction is a real risk expiry exists to
-  // bound, and that risk doesn't go away just because reveal has a different one.
-  return jwt.verify(token, secret, { ignoreExpiration: options?.ignoreExpiration ?? false }) as AuctionTokenPayload;
+  return jwt.verify(token, secret) as AuctionTokenPayload;
 }
 
 // Loads the same way as the JWT secret (AWS Secrets Manager in production, plain env var in local
 // dev) rather than reading process.env directly — see secrets.ts.
 async function getIpHashSecret(): Promise<string> {
-  const secret = await loadSecret('IP_HASH_HMAC_SECRET', 'IP_HASH_HMAC_SECRET_ARN');
+  const secret = await loadRequiredSecret('IP_HASH_HMAC_SECRET', 'IP_HASH_HMAC_SECRET_ARN');
   if (!secret) {
     logger.warn('IP_HASH_HMAC_SECRET is not set — falling back to an insecure dev-only default. Set it before any real test.');
     return 'dev-only-insecure-ip-hash-secret';

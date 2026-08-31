@@ -1,13 +1,13 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
-import rateLimit from 'express-rate-limit';
+import { jsonRateLimit as rateLimit } from '../lib/rateLimit.js';
 import multer from 'multer';
 import { z } from 'zod';
 import { Tender } from '../models/Tender.js';
 import { TenderInvitation } from '../models/TenderInvitation.js';
 import { EmdSubmission } from '../models/EmdSubmission.js';
 import { releaseEmd, invokeEmd } from '../services/emdOutcomeService.js';
-import { verifyOrgToken, type OrgTokenPayload } from '../lib/orgAuth.js';
 import { uploadObject, getSignedDownloadUrl } from '../lib/s3.js';
+import { authRequired } from '../middleware/auth.js';
 import { logger } from '../lib/logger.js';
 
 // EMD as a document (Bank Guarantee), not money — see EmdSubmission's own comment for why this
@@ -58,20 +58,6 @@ const resolveBodySchema = z.object({
   dispatchReference: z.string().trim().max(MAX_STRING_FIELD_LENGTH).optional(),
 });
 
-function extractBearerToken(authHeader: string | undefined): string | undefined {
-  return authHeader?.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : undefined;
-}
-
-async function requireOrgAuth(authHeader: string | undefined): Promise<OrgTokenPayload | null> {
-  const token = extractBearerToken(authHeader);
-  if (!token) return null;
-  try {
-    return await verifyOrgToken(token);
-  } catch {
-    return null;
-  }
-}
-
 function s3KeyForEmdDocument(tenderId: number, organizationId: number, filename: string): string {
   return `emd-submissions/${tenderId}/${organizationId}-${Date.now()}-${filename}`;
 }
@@ -103,19 +89,13 @@ function serializeSubmission(s: EmdSubmission, documentUrl: string | null) {
 // Generator submits (or replaces, while still 'submitted') its EMD Bank Guarantee for a tender.
 // Gated on an accepted invitation — same bar as document-checklist uploads (tenderDocuments.ts) and
 // bid submission itself, since this is part of assembling that same submission.
-router.post('/tenders/:id/emd-submission', writeLimiter, upload.single('document'), async (req, res, next) => {
+router.post('/tenders/:id/emd-submission', writeLimiter, ...authRequired('generator'), upload.single('document'), async (req, res, next) => {
   try {
     const tenderId = Number(req.params.id);
     if (!Number.isFinite(tenderId)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
 
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-    if (payload.type !== 'generator') {
-      return res.status(403).json({ success: false, error: 'Only generator organizations submit an EMD' });
-    }
-
     const invitation = await TenderInvitation.findOne({
-      where: { tenderId, organizationId: payload.organizationId, status: 'accepted' },
+      where: { tenderId, organizationId: req.org!.id, status: 'accepted' },
     });
     if (!invitation) {
       return res.status(403).json({ success: false, error: 'You must accept this tender\'s invitation before submitting an EMD' });
@@ -129,19 +109,19 @@ router.post('/tenders/:id/emd-submission', writeLimiter, upload.single('document
       return res.status(400).json({ success: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
     }
 
-    const existing = await EmdSubmission.findOne({ where: { tenderId, organizationId: payload.organizationId } });
+    const existing = await EmdSubmission.findOne({ where: { tenderId, organizationId: req.org!.id } });
     if (existing && existing.status !== 'submitted') {
       return res.status(409).json({ success: false, error: `Your EMD for this tender has already been ${existing.status} — it can no longer be replaced` });
     }
 
     if (!req.file) return res.status(400).json({ success: false, error: 'A scanned PDF of the Bank Guarantee is required' });
 
-    const s3Key = s3KeyForEmdDocument(tenderId, payload.organizationId, req.file.originalname);
+    const s3Key = s3KeyForEmdDocument(tenderId, req.org!.id, req.file.originalname);
     await uploadObject(s3Key, req.file.buffer, 'application/pdf');
 
     const fields = {
       tenderId,
-      organizationId: payload.organizationId,
+      organizationId: req.org!.id,
       bankName: parsed.data.bankName,
       guaranteeNumber: parsed.data.guaranteeNumber,
       amountPaise: parsed.data.amountPaise,
@@ -159,7 +139,7 @@ router.post('/tenders/:id/emd-submission', writeLimiter, upload.single('document
     const submission = existing ? await existing.update(fields) : await EmdSubmission.create(fields);
 
     logger.info(
-      { reqId: req.requestId, tenderId, organizationId: payload.organizationId, submissionId: submission.id, replaced: Boolean(existing) },
+      { reqId: req.requestId, tenderId, organizationId: req.org!.id, submissionId: submission.id, replaced: Boolean(existing) },
       '[EMD] submission recorded'
     );
 
@@ -170,18 +150,12 @@ router.post('/tenders/:id/emd-submission', writeLimiter, upload.single('document
 });
 
 // A generator's own submission status — used to gate/inform the bid-submission page.
-router.get('/tenders/:id/emd-submission/mine', readLimiter, async (req, res, next) => {
+router.get('/tenders/:id/emd-submission/mine', readLimiter, ...authRequired('generator'), async (req, res, next) => {
   try {
     const tenderId = Number(req.params.id);
     if (!Number.isFinite(tenderId)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
 
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-    if (payload.type !== 'generator') {
-      return res.status(403).json({ success: false, error: 'Only generator organizations have this view' });
-    }
-
-    const submission = await EmdSubmission.findOne({ where: { tenderId, organizationId: payload.organizationId } });
+    const submission = await EmdSubmission.findOne({ where: { tenderId, organizationId: req.org!.id } });
     if (!submission) return res.json({ success: true, submission: null });
 
     res.json({ success: true, submission: serializeSubmission(submission, null) });
@@ -192,16 +166,10 @@ router.get('/tenders/:id/emd-submission/mine', readLimiter, async (req, res, nex
 
 // Admin-only: every EMD submission on file for a tender, so admin can decide release/invoke per
 // generator.
-router.get('/tenders/:id/emd-submissions', readLimiter, async (req, res, next) => {
+router.get('/tenders/:id/emd-submissions', readLimiter, ...authRequired('admin'), async (req, res, next) => {
   try {
     const tenderId = Number(req.params.id);
     if (!Number.isFinite(tenderId)) return res.status(400).json({ success: false, error: 'Invalid tender id' });
-
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-    if (payload.type !== 'admin') {
-      return res.status(403).json({ success: false, error: 'Only admin organizations have this view' });
-    }
 
     const submissions = await EmdSubmission.findAll({ where: { tenderId }, order: [['id', 'ASC']] });
     res.json({
@@ -217,18 +185,12 @@ router.get('/tenders/:id/emd-submissions', readLimiter, async (req, res, next) =
 
 // Admin marks a generator's EMD as physically returned. Manual and explicit on purpose — see
 // EmdSubmission's comment for why there is no automatic trigger any more.
-router.post('/tenders/:id/emd-submissions/:organizationId/release', resolveLimiter, async (req, res, next) => {
+router.post('/tenders/:id/emd-submissions/:organizationId/release', resolveLimiter, ...authRequired('admin'), async (req, res, next) => {
   try {
     const tenderId = Number(req.params.id);
     const organizationId = Number(req.params.organizationId);
     if (!Number.isFinite(tenderId) || !Number.isFinite(organizationId)) {
       return res.status(400).json({ success: false, error: 'Invalid tender or organization id' });
-    }
-
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-    if (payload.type !== 'admin') {
-      return res.status(403).json({ success: false, error: 'Only admin organizations can release an EMD' });
     }
 
     const parsed = resolveBodySchema.safeParse(req.body);
@@ -251,18 +213,12 @@ router.post('/tenders/:id/emd-submissions/:organizationId/release', resolveLimit
 });
 
 // Admin marks a generator's EMD as invoked with the issuing bank — the document is not returned.
-router.post('/tenders/:id/emd-submissions/:organizationId/invoke', resolveLimiter, async (req, res, next) => {
+router.post('/tenders/:id/emd-submissions/:organizationId/invoke', resolveLimiter, ...authRequired('admin'), async (req, res, next) => {
   try {
     const tenderId = Number(req.params.id);
     const organizationId = Number(req.params.organizationId);
     if (!Number.isFinite(tenderId) || !Number.isFinite(organizationId)) {
       return res.status(400).json({ success: false, error: 'Invalid tender or organization id' });
-    }
-
-    const payload = await requireOrgAuth(req.headers.authorization);
-    if (!payload) return res.status(401).json({ success: false, error: 'Missing or invalid organization token' });
-    if (payload.type !== 'admin') {
-      return res.status(403).json({ success: false, error: 'Only admin organizations can invoke an EMD' });
     }
 
     const parsed = resolveBodySchema.pick({ reason: true }).safeParse(req.body);

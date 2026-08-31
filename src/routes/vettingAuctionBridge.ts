@@ -1,17 +1,19 @@
 import { Router } from 'express';
-import rateLimit from 'express-rate-limit';
+import { jsonRateLimit as rateLimit } from '../lib/rateLimit.js';
 import { z } from 'zod';
 import { VettingBid } from '../models/VettingBid.js';
 import { VettingDecidedRecord } from '../models/VettingDecidedRecord.js';
 import { VettingOpeningAttestation } from '../models/VettingOpeningAttestation.js';
+import { Tender } from '../models/Tender.js';
 import { Auction } from '../models/Auction.js';
 import { AuctionParticipant } from '../models/AuctionParticipant.js';
 import { Organization } from '../models/Organization.js';
 import { generateJti, signJoinToken } from '../lib/auctionTokens.js';
-import { initAuctionState, startAuctionClock, MIN_UNDERCUT } from '../services/auctionEngine.js';
+import { initAuctionState, activateScheduledAuction, MIN_UNDERCUT } from '../services/auctionEngine.js';
 import { encryptField, decryptField } from '../lib/fieldEncryption.js';
 import { sendAuctionJoinLinkEmail } from '../services/email.js';
 import { logger } from '../lib/logger.js';
+import { authRequired } from '../middleware/auth.js';
 
 const router = Router();
 
@@ -59,7 +61,10 @@ async function seedAuctionStandalone(
   openingBid: number,
   participants: Array<{ alias: string; organizationName: string; generatorOrgId: number | null }>,
   tenderRef: number,
-  scheduledStartAt: Date
+  scheduledStartAt: Date,
+  useLandedRate: boolean,
+  equityValue: number | null,
+  totalUnitsPerYear: number | null
 ) {
   // Same ordering rationale already established for the manual seed route: create 'scheduled',
   // start the clock only once every participant has a real join link ready, flip to 'live' last.
@@ -72,29 +77,46 @@ async function seedAuctionStandalone(
     maxAutoExtensions: DEFAULT_MAX_AUTO_EXTENSIONS,
     minUndercut: String(MIN_UNDERCUT),
     tenderRef,
+    useLandedRate,
+    equityValue: equityValue !== null ? String(equityValue) : null,
+    totalUnitsPerYear: totalUnitsPerYear !== null ? String(totalUnitsPerYear) : null,
+    scheduledStartAt,
   });
 
-  await initAuctionState(auction.id, openingBid, DEFAULT_WINDOW_SECONDS, DEFAULT_MAX_AUTO_EXTENSIONS, MIN_UNDERCUT);
+  await initAuctionState(
+    auction.id,
+    openingBid,
+    DEFAULT_WINDOW_SECONDS,
+    DEFAULT_MAX_AUTO_EXTENSIONS,
+    MIN_UNDERCUT,
+    useLandedRate,
+    equityValue ?? 0,
+    totalUnitsPerYear ?? 0
+  );
+
+  // Generic per-auction link, not a per-participant bearer credential — see routes/auctions.ts's
+  // /join and AuctionParticipant's own comment. Every real (org-backed) participant gets the exact
+  // same URL; it grants nothing on its own, so there's no reason to vary it per recipient.
+  const joinPath = `/auction-live?auctionId=${auction.id}`;
 
   const links = [];
   for (const p of participants) {
-    const jti = generateJti();
     const participant = await AuctionParticipant.create({
       auctionId: auction.id,
       organizationName: await encryptField(p.organizationName),
+      organizationId: p.generatorOrgId,
       alias: p.alias,
       role: 'generator',
-      joinTokenId: jti,
+      joinTokenId: generateJti(),
     });
-    const token = await signJoinToken({ auctionId: auction.id, participantId: participant.id, alias: p.alias, jti });
-    const joinPath = `/auction-live?token=${encodeURIComponent(token)}`;
-    links.push({ alias: p.alias, joinUrl: joinPath });
+    links.push({ alias: p.alias, joinUrl: frontendUrl(joinPath), organizationId: participant.organizationId });
 
     // Stage 7: "Approved generators receive a scheduled auction link" — fire-and-forget, same as
     // invoiceService.ts's hook: a slow/broken email send must never delay the auction actually
     // going live for everyone else. generatorOrgId is null for placeholder/legacy submissions
-    // (see VettingBid's own comment) — nothing to email in that case, skip silently rather than
-    // failing the whole promotion over one missing link.
+    // (see VettingBid's own comment) — nothing to email in that case (and nothing they could join
+    // with either, since /join requires a real org to log in as), skip silently rather than failing
+    // the whole promotion over one missing link.
     if (p.generatorOrgId !== null) {
       Organization.findByPk(p.generatorOrgId)
         .then((org) => {
@@ -107,16 +129,38 @@ async function seedAuctionStandalone(
     }
   }
 
-  // In-process timer only, same PoC bar as the rest of this internal bridge (see module comment)
-  // — a server restart between now and scheduledStartAt loses this timer and the auction is stuck
-  // 'scheduled' forever, needing a manual fix. Fine for this tool; a real deployment would need a
-  // persistent job (durable queue or a DB-polled scheduler) instead. The auction is created (and
-  // stays) 'scheduled' here — startAuctionClock/status:'live' only ever happen later, inside this
-  // timer, never at generation time.
+  // Whether the real buyer org should get a seat here at all is a pending product decision (would
+  // mean org-login-gated access via /auctions/:id/join, same as generators) — not decided yet, so
+  // not built here. In the meantime, this seat is a read-only spectator link for ADMIN's own use:
+  // no org login involved (a bearer token embedded directly in the link, same legacy mechanism
+  // auctionAdmin.ts's manual-seed buyer link already uses), just something admin can open to watch
+  // the real auction happen. It also happens to be a real AuctionParticipant with role 'buyer',
+  // which is what routes/auctions.ts's winner-identity reveal requires to exist at all — without
+  // this, the winning generator's own reveal call finds no buyer seat and 404s.
+  const spectatorParticipant = await AuctionParticipant.create({
+    auctionId: auction.id,
+    organizationName: await encryptField('Wattmatch admin (spectator)'),
+    alias: 'SPECTATOR',
+    role: 'buyer',
+    joinTokenId: generateJti(),
+  });
+  const spectatorToken = await signJoinToken({
+    auctionId: auction.id,
+    participantId: spectatorParticipant.id,
+    alias: spectatorParticipant.alias,
+    jti: spectatorParticipant.joinTokenId,
+  });
+  const spectatorLink = { alias: spectatorParticipant.alias, joinUrl: `${frontendUrl('/auction-live')}?token=${encodeURIComponent(spectatorToken)}` };
+
+  // In-process timer for the precise, on-time path — a server restart between now and
+  // scheduledStartAt loses this specific timer, but auction.scheduledStartAt (persisted above) lets
+  // auctionEngine.ts's startScheduledAuctionActivationLoop self-heal within one check interval of
+  // the server coming back up, instead of the auction being stuck 'scheduled' forever with no
+  // automatic path out. The auction is created (and stays) 'scheduled' here — activateScheduledAuction
+  // only ever happens later, via whichever of the two paths gets there first.
   const delayMs = scheduledStartAt.getTime() - Date.now();
   setTimeout(() => {
-    startAuctionClock(auction.id, DEFAULT_WINDOW_SECONDS)
-      .then(() => Auction.update({ status: 'live' }, { where: { id: auction.id } }))
+    activateScheduledAuction(auction.id, DEFAULT_WINDOW_SECONDS)
       .then(() => {
         logger.info({ auctionId: auction.id, scheduledStartAt }, '[VETTING_BRIDGE] scheduled auction went live');
       })
@@ -125,13 +169,14 @@ async function seedAuctionStandalone(
       });
   }, delayMs);
 
-  return { auctionId: auction.id, scheduledStartAt: scheduledStartAt.toISOString(), links };
+  return { auctionId: auction.id, scheduledStartAt: scheduledStartAt.toISOString(), links, spectatorLink };
 }
 
 // Promotes a tender's approved, financially-opened generators into a live auction — see
 // VETTING_TO_AUCTION_BRIDGE_PLAN.md. Requires the financial ceremony to have already run for this
 // tenderRef; computes the opening bid as the lowest financial bid among approved generators.
-router.post('/vetting-bids/:tenderRef/promote-to-auction', promoteLimiter, async (req, res, next) => {
+// Admin-only: this is the "schedule the auction, generators get emailed automatically" action.
+router.post('/vetting-bids/:tenderRef/promote-to-auction', promoteLimiter, ...authRequired('admin'), async (req, res, next) => {
   try {
     const tenderRef = Number(req.params.tenderRef);
     if (!Number.isFinite(tenderRef)) return res.status(400).json({ success: false, error: 'Invalid tenderRef' });
@@ -158,6 +203,15 @@ router.post('/vetting-bids/:tenderRef/promote-to-auction', promoteLimiter, async
     const financialAttestation = await VettingOpeningAttestation.findOne({ where: { tenderRef: String(tenderRef), envelope: 'financial' } });
     if (!financialAttestation) {
       return res.status(409).json({ success: false, error: 'Financial ceremony has not been run for this tender yet' });
+    }
+
+    // Landed-rate formula inputs (see auctionEngine.ts's computeLandedRate) — copied onto the
+    // Auction row this promotion creates, not read live from Tender during bidding. Only required
+    // when this tender was actually created as a landed-rate one (see Tender.useLandedRate).
+    const tender = await Tender.findByPk(tenderRef);
+    if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
+    if (tender.useLandedRate && (tender.equityValue === null || tender.totalUnitsPerYear === null)) {
+      return res.status(409).json({ success: false, error: 'This tender has no equityValue/totalUnitsPerYear set — cannot promote to a live auction' });
     }
 
     // Double-promotion guard — an Auction already tied to this tenderRef means it's already been
@@ -202,7 +256,10 @@ router.post('/vetting-bids/:tenderRef/promote-to-auction', promoteLimiter, async
       openingBid,
       participants.map((p) => ({ alias: p.alias, organizationName: p.organizationName, generatorOrgId: p.generatorOrgId })),
       tenderRef,
-      scheduledStartAt
+      scheduledStartAt,
+      tender.useLandedRate,
+      tender.equityValue !== null ? Number(tender.equityValue) : null,
+      tender.totalUnitsPerYear !== null ? Number(tender.totalUnitsPerYear) : null
     );
 
     logger.info(
