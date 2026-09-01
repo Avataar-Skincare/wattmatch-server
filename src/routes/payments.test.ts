@@ -142,6 +142,74 @@ describe.runIf(hasRazorpayConfig)('payments routes', () => {
     expect(payment!.organizationId).toBe(buyerOrgId);
   });
 
+  it('a second order request for the same tender+purpose while the first is unpaid resumes that same order, not a new one', async () => {
+    const scopedTender = await Tender.create({ buyerOrgId, title: `Payments dedup test tender ${Date.now()}`, requiredCapacityMw: '5' });
+    try {
+      const first = await postJson('/api/payment/orders', { purpose: 'bid_processing', tenderId: scopedTender.id }, { Authorization: `Bearer ${buyerToken}` });
+      expect(first.status).toBe(200);
+
+      const second = await postJson('/api/payment/orders', { purpose: 'bid_processing', tenderId: scopedTender.id }, { Authorization: `Bearer ${buyerToken}` });
+      expect(second.status).toBe(200);
+      expect(second.body.orderId).toBe(first.body.orderId);
+
+      const paymentCount = await Payment.count({ where: { tenderId: scopedTender.id, organizationId: buyerOrgId, purpose: 'bid_processing' } });
+      expect(paymentCount).toBe(1);
+    } finally {
+      await Payment.destroy({ where: { tenderId: scopedTender.id } });
+      await Tender.destroy({ where: { id: scopedTender.id } });
+    }
+  });
+
+  it('a further order request after the fee is already paid is rejected with 409, not a second charge', async () => {
+    const scopedTender = await Tender.create({ buyerOrgId, title: `Payments dedup paid test tender ${Date.now()}`, requiredCapacityMw: '5' });
+    try {
+      const orderRes = await postJson('/api/payment/orders', { purpose: 'bid_processing', tenderId: scopedTender.id }, { Authorization: `Bearer ${buyerToken}` });
+      expect(orderRes.status).toBe(200);
+
+      const payload = {
+        entity: 'event',
+        event: 'payment.captured',
+        payload: { payment: { entity: { id: `pay_TEST${Date.now()}`, order_id: orderRes.body.orderId } } },
+      };
+      const bodyString = JSON.stringify(payload);
+      await postRaw('/api/payment/webhook', bodyString, { 'x-razorpay-signature': signWebhook(bodyString) });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const again = await postJson('/api/payment/orders', { purpose: 'bid_processing', tenderId: scopedTender.id }, { Authorization: `Bearer ${buyerToken}` });
+      expect(again.status).toBe(409);
+
+      const paymentCount = await Payment.count({ where: { tenderId: scopedTender.id, organizationId: buyerOrgId, purpose: 'bid_processing' } });
+      expect(paymentCount).toBe(1);
+    } finally {
+      await Payment.destroy({ where: { tenderId: scopedTender.id } });
+      await Tender.destroy({ where: { id: scopedTender.id } });
+    }
+  });
+
+  it('two genuinely concurrent order requests for the same tender+purpose+org create only one order, not two', async () => {
+    // Regression test for the TOCTOU race the payment-order lock closes: without it, two requests
+    // that both arrive before either's Payment.create() has landed can both pass the "no existing
+    // order" dedup check and each mint a separate Razorpay order for the same fee.
+    const scopedTender = await Tender.create({ buyerOrgId, title: `Payments concurrency test tender ${Date.now()}`, requiredCapacityMw: '5' });
+    try {
+      const [first, second] = await Promise.all([
+        postJson('/api/payment/orders', { purpose: 'bid_processing', tenderId: scopedTender.id }, { Authorization: `Bearer ${buyerToken}` }),
+        postJson('/api/payment/orders', { purpose: 'bid_processing', tenderId: scopedTender.id }, { Authorization: `Bearer ${buyerToken}` }),
+      ]);
+
+      const statuses = [first.status, second.status].sort();
+      // Whichever request loses the lock gets a 409 asking it to retry, rather than silently
+      // spawning a second order — exactly one of the two actually creates a payment.
+      expect(statuses).toEqual([200, 409]);
+
+      const paymentCount = await Payment.count({ where: { tenderId: scopedTender.id, organizationId: buyerOrgId, purpose: 'bid_processing' } });
+      expect(paymentCount).toBe(1);
+    } finally {
+      await Payment.destroy({ where: { tenderId: scopedTender.id } });
+      await Tender.destroy({ where: { id: scopedTender.id } });
+    }
+  });
+
   it('/verify rejects a tampered signature and marks the payment failed, then refuses a second attempt', async () => {
     const orderRes = await postJson('/api/payment/orders/rfs-document', { tenderId, payerName: 'B', payerEmail: 'b@test.local', ...RFS_STAGE3_FIELDS });
     const fakePaymentId = `pay_TEST${Date.now()}`;

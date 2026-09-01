@@ -6,6 +6,8 @@ import { TenderInvitation } from '../models/TenderInvitation.js';
 import { TenderDocumentField } from '../models/TenderDocumentField.js';
 import { TenderDocumentUpload } from '../models/TenderDocumentUpload.js';
 import { VettingOpeningAttestation } from '../models/VettingOpeningAttestation.js';
+import { DefaultTenderDocumentTemplate } from '../models/DefaultTenderDocumentTemplate.js';
+import { DEFAULT_FIELDS, seedDefaultDocumentFields } from '../services/defaultTenderDocumentFields.js';
 import { signOrgToken } from '../lib/orgAuth.js';
 
 let app: express.Express;
@@ -92,6 +94,11 @@ async function postMultipart(path: string, fields: Record<string, string>, file:
 
 async function get(path: string, token?: string) {
   const res = await fetch(`${baseUrl}${path}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+  return { status: res.status, body: await res.json() };
+}
+
+async function del(path: string, token?: string) {
+  const res = await fetch(`${baseUrl}${path}`, { method: 'DELETE', headers: token ? { Authorization: `Bearer ${token}` } : {} });
   return { status: res.status, body: await res.json() };
 }
 
@@ -239,5 +246,161 @@ describe('tenderDocuments routes', () => {
     expect(remainingField).toBeNull();
     const remainingUpload = await TenderDocumentUpload.findOne({ where: { fieldId } });
     expect(remainingUpload).toBeNull();
+  });
+
+  describe('default document templates', () => {
+    const key = DEFAULT_FIELDS[0].key;
+
+    afterAll(async () => {
+      await DefaultTenderDocumentTemplate.destroy({ where: { key } });
+    });
+
+    it('rejects setting a default for a key that is not on the DEFAULT_FIELDS checklist', async () => {
+      const res = await postMultipart(
+        `/api/default-document-templates/not_a_real_key/template`,
+        {},
+        { field: 'template', filename: 'x.pdf', content: pdfBuffer(), contentType: 'application/pdf' },
+        adminToken
+      );
+      expect(res.status).toBe(404);
+    });
+
+    it('only admin can set a default template', async () => {
+      const res = await postMultipart(
+        `/api/default-document-templates/${key}/template`,
+        {},
+        { field: 'template', filename: 'x.pdf', content: pdfBuffer(), contentType: 'application/pdf' },
+        buyerToken
+      );
+      expect(res.status).toBe(403);
+    });
+
+    it('an admin can set a default template, and it shows up in the listing as downloadable', async () => {
+      const res = await postMultipart(
+        `/api/default-document-templates/${key}/template`,
+        {},
+        { field: 'template', filename: 'default.pdf', content: pdfBuffer(), contentType: 'application/pdf' },
+        adminToken
+      );
+      expect(res.status).toBe(200);
+
+      const list = await get('/api/default-document-templates', adminToken);
+      expect(list.status).toBe(200);
+      const entry = list.body.templates.find((t: { key: string }) => t.key === key);
+      expect(entry.hasTemplate).toBe(true);
+      expect(entry.templateOriginalFilename).toBe('default.pdf');
+
+      const pdfRes = await fetch(entry.templateUrl);
+      const buf = Buffer.from(await pdfRes.arrayBuffer());
+      expect(buf.subarray(0, 4).toString()).toBe('%PDF');
+    });
+
+    it('a newly created tender is seeded with the default template already attached, with no per-tender upload', async () => {
+      const freshTender = await Tender.create({ buyerOrgId, title: `Default-template test tender ${Date.now()}`, requiredCapacityMw: '5' });
+      try {
+        await seedDefaultDocumentFields(freshTender.id);
+
+        const field = await TenderDocumentField.findOne({ where: { tenderId: freshTender.id, key } });
+        expect(field?.templateS3Key).not.toBeNull();
+        expect(field?.templateOriginalFilename).toBe('default.pdf');
+      } finally {
+        await TenderDocumentField.destroy({ where: { tenderId: freshTender.id } });
+        await Tender.destroy({ where: { id: freshTender.id } });
+      }
+    });
+
+    it('removing the default does not affect a tender already seeded with it, but new tenders stop getting it', async () => {
+      const delRes = await del(`/api/default-document-templates/${key}/template`, adminToken);
+      expect(delRes.status).toBe(200);
+
+      const list = await get('/api/default-document-templates', adminToken);
+      const entry = list.body.templates.find((t: { key: string }) => t.key === key);
+      expect(entry.hasTemplate).toBe(false);
+
+      const freshTender = await Tender.create({ buyerOrgId, title: `Post-removal test tender ${Date.now()}`, requiredCapacityMw: '5' });
+      try {
+        await seedDefaultDocumentFields(freshTender.id);
+        const field = await TenderDocumentField.findOne({ where: { tenderId: freshTender.id, key } });
+        expect(field?.templateS3Key).toBeNull();
+      } finally {
+        await TenderDocumentField.destroy({ where: { tenderId: freshTender.id } });
+        await Tender.destroy({ where: { id: freshTender.id } });
+      }
+    });
+
+    it('deleting a default that was never set returns 404', async () => {
+      const res = await del(`/api/default-document-templates/${key}/template`, adminToken);
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe('setAsDefault on a per-tender template upload', () => {
+    // A different DEFAULT_FIELDS key than the 'default document templates' block above, so the two
+    // groups can't interfere with each other's default state.
+    const key = DEFAULT_FIELDS[1].key;
+    let fieldId: number;
+
+    afterAll(async () => {
+      await DefaultTenderDocumentTemplate.destroy({ where: { key } });
+    });
+
+    it('sets up a tender field using a real default-checklist key', async () => {
+      const res = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: DEFAULT_FIELDS[1].envelope, key, label: DEFAULT_FIELDS[1].label }, null, adminToken);
+      expect(res.status).toBe(200);
+      fieldId = res.body.id;
+
+      const list = await get(`/api/tenders/${tenderId}/document-fields`, adminToken);
+      const field = list.body.fields.find((f: { id: number }) => f.id === fieldId);
+      expect(field.templateSource).toBe('none');
+      expect(field.canSetAsDefault).toBe(true);
+    });
+
+    it('rejects setAsDefault for a field whose key is not on the DEFAULT_FIELDS checklist', async () => {
+      const customFieldRes = await postMultipart(`/api/tenders/${tenderId}/document-fields`, { envelope: 'technical', key: 'not_a_default_key', label: 'Not A Default' }, null, adminToken);
+      const customFieldId = customFieldRes.body.id;
+      const rejectRes = await postMultipart(
+        `/api/tenders/${tenderId}/document-fields/${customFieldId}/template`,
+        { setAsDefault: 'true' },
+        { field: 'template', filename: 'x.pdf', content: pdfBuffer(), contentType: 'application/pdf' },
+        adminToken
+      );
+      expect(rejectRes.status).toBe(400);
+    });
+
+    it('uploading with setAsDefault=true both replaces this tender\'s template and creates the platform default', async () => {
+      const res = await postMultipart(
+        `/api/tenders/${tenderId}/document-fields/${fieldId}/template`,
+        { setAsDefault: 'true' },
+        { field: 'template', filename: 'first-upload.pdf', content: pdfBuffer(), contentType: 'application/pdf' },
+        adminToken
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.setAsDefault).toBe(true);
+
+      const defaultRow = await DefaultTenderDocumentTemplate.findOne({ where: { key } });
+      expect(defaultRow?.templateOriginalFilename).toBe('first-upload.pdf');
+
+      const list = await get(`/api/tenders/${tenderId}/document-fields`, adminToken);
+      const field = list.body.fields.find((f: { id: number }) => f.id === fieldId);
+      expect(field.templateSource).toBe('default');
+    });
+
+    it('a later reupload without setAsDefault only replaces this tender\'s template, leaving the platform default untouched', async () => {
+      const res = await postMultipart(
+        `/api/tenders/${tenderId}/document-fields/${fieldId}/template`,
+        {},
+        { field: 'template', filename: 'tender-only.pdf', content: pdfBuffer(), contentType: 'application/pdf' },
+        adminToken
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.setAsDefault).toBe(false);
+
+      const defaultRow = await DefaultTenderDocumentTemplate.findOne({ where: { key } });
+      expect(defaultRow?.templateOriginalFilename).toBe('first-upload.pdf');
+
+      const list = await get(`/api/tenders/${tenderId}/document-fields`, adminToken);
+      const field = list.body.fields.find((f: { id: number }) => f.id === fieldId);
+      expect(field.templateSource).toBe('custom');
+    });
   });
 });

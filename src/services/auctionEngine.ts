@@ -293,8 +293,20 @@ export async function getAuctionState(auctionId: number): Promise<AuctionRedisSt
   };
 }
 
+// Redis's only job for this key was fast concurrent-bid state during active bidding — once closed,
+// MySQL (Auction's own currentLowestBid/currentLeaderParticipantId, mirrored on every accepted bid;
+// see auctionSocket.ts's own comment on why) has already durably held the same information the
+// entire time, plus the full bid history AuctionBid/AuctionBidAudit never lived in Redis at all.
+// Left with no TTL, this hash would accumulate forever with nothing ever reclaiming it — 24h is
+// generous for "someone reconnects to check the result shortly after," short enough not to linger
+// indefinitely, and safe to expire because auctionSocket.ts's connect handler now falls back to
+// Auction.resultSummaryJson (built at close, see buildAndStoreResultSummary) once this is gone.
+const CLOSED_AUCTION_STATE_TTL_SECONDS = 24 * 60 * 60;
+
 export async function markAuctionClosed(auctionId: number) {
-  await redis.hset(auctionKey(auctionId), { status: 'closed' });
+  const key = auctionKey(auctionId);
+  await redis.hset(key, { status: 'closed' });
+  await redis.expire(key, CLOSED_AUCTION_STATE_TTL_SECONDS);
 }
 
 interface AuditedBidInput {

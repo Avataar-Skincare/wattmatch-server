@@ -85,17 +85,15 @@ export const seedBodySchema = z
 // Participant-facing auction routes (join, winner-identity) live in routes/auctions.ts, not here —
 // this file is admin-only auction management.
 const seedLimiter = rateLimit({
+  name: 'auctionAdmin:seed',
   windowMs: 15 * 60 * 1000,
   limit: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
   message: { success: false, error: 'Too many auctions created from this IP — try again later.' },
 });
 const exportLimiter = rateLimit({
+  name: 'auctionAdmin:export',
   windowMs: 60 * 1000,
   limit: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
   message: { success: false, error: 'Too many export requests from this IP — try again shortly.' },
 });
 

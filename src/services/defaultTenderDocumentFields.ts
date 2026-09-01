@@ -1,6 +1,8 @@
+import type { Transaction } from 'sequelize';
 import { TenderDocumentField, type DocumentEnvelope } from '../models/TenderDocumentField.js';
+import { DefaultTenderDocumentTemplate } from '../models/DefaultTenderDocumentTemplate.js';
 
-interface DefaultField {
+export interface DefaultField {
   envelope: DocumentEnvelope;
   key: string;
   label: string;
@@ -12,7 +14,7 @@ interface DefaultField {
 // of these per tender (§6.3), so this is a starting point, not a fixed schema. Consortium-related
 // fields stay optional per Red Flag #7: the paperwork slot exists, but WattMatch hasn't decided to
 // actually support consortium bids, so nothing here assumes it does.
-const DEFAULT_FIELDS: DefaultField[] = [
+export const DEFAULT_FIELDS: DefaultField[] = [
   // §6.1 RfS Formats
   { envelope: 'technical', key: 'covering_letter', label: 'Covering Letter (Format 7.1)', required: true },
   { envelope: 'technical', key: 'power_of_attorney', label: 'Power of Attorney (Format 7.2, if applicable)', required: false },
@@ -49,17 +51,28 @@ const DEFAULT_FIELDS: DefaultField[] = [
   { envelope: 'financial', key: 'preliminary_cost_estimate', label: 'Preliminary Estimate of Cost of Project (Format 7.12)', required: true },
 ];
 
-export async function seedDefaultDocumentFields(tenderId: number): Promise<void> {
+export async function seedDefaultDocumentFields(tenderId: number, transaction?: Transaction): Promise<void> {
+  // Platform-wide blank-format templates (uploaded once via the /default-document-templates admin
+  // routes in tenderDocuments.ts) — pre-fill every matching field here so an admin doesn't have to
+  // re-upload the same format for every new tender. A field with no matching row here just starts
+  // with no template, exactly as before this table existed.
+  const defaults = await DefaultTenderDocumentTemplate.findAll({ transaction });
+  const defaultByKey = new Map(defaults.map((d) => [d.key, d]));
+
   await TenderDocumentField.bulkCreate(
-    DEFAULT_FIELDS.map((f, index) => ({
-      tenderId,
-      envelope: f.envelope,
-      key: f.key,
-      label: f.label,
-      required: f.required,
-      templateS3Key: null,
-      templateOriginalFilename: null,
-      sortOrder: index,
-    }))
+    DEFAULT_FIELDS.map((f, index) => {
+      const defaultTemplate = defaultByKey.get(f.key);
+      return {
+        tenderId,
+        envelope: f.envelope,
+        key: f.key,
+        label: f.label,
+        required: f.required,
+        templateS3Key: defaultTemplate?.templateS3Key ?? null,
+        templateOriginalFilename: defaultTemplate?.templateOriginalFilename ?? null,
+        sortOrder: index,
+      };
+    }),
+    { transaction }
   );
 }

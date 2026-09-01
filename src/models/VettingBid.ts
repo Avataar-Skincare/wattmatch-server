@@ -74,5 +74,11 @@ VettingBid.init(
     tableName: 'wattmatch_vetting_bids',
     underscored: true,
     updatedAt: false,
+    // Backs the "one sealed bid per generator per tender" invariant at the DB level — previously
+    // only an application-level findOne-then-create check in vettingBids.ts, which two
+    // near-simultaneous submissions from the same generator could both pass. NULL generatorOrgId
+    // (legacy rows submitted before invitation-gated submission existed) is exempt: MySQL treats
+    // each NULL as distinct in a unique index, so those aren't affected.
+    indexes: [{ unique: true, fields: ['tender_ref', 'generator_org_id'] }],
   }
 );

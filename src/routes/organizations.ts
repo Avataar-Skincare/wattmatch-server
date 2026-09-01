@@ -66,15 +66,15 @@ const adminInviteBodySchema = z.object({
   phone: z.string().trim().min(1, 'phone is required').max(MAX_STRING_FIELD_LENGTH),
 });
 
-const registerLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
+const registerLimiter = rateLimit({ name: 'organizations:register', windowMs: 15 * 60 * 1000, limit: 30 });
 // Tight, specifically to blunt credential stuffing — the one real risk that shows up once every
 // account type has a persistent reusable secret.
-const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
-const tokenRequestLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
-const tokenConsumeLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false });
+const loginLimiter = rateLimit({ name: 'organizations:login', windowMs: 15 * 60 * 1000, limit: 10 });
+const tokenRequestLimiter = rateLimit({ name: 'organizations:tokenRequest', windowMs: 15 * 60 * 1000, limit: 10 });
+const tokenConsumeLimiter = rateLimit({ name: 'organizations:tokenConsume', windowMs: 15 * 60 * 1000, limit: 20 });
 // Admin-inviting-admin is rare and consequential — tighter than registerLimiter, matching the bar
 // other admin-only consequential actions use elsewhere (e.g. payments.ts's refund/reconcile limiters).
-const adminInviteLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
+const adminInviteLimiter = rateLimit({ name: 'organizations:adminInvite', windowMs: 15 * 60 * 1000, limit: 10 });
 
 function frontendUrl(path: string): string {
   const origin = process.env.CORS_ORIGIN ?? 'http://localhost:5173';

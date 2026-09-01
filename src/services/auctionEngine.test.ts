@@ -236,6 +236,16 @@ describe('submitBid — Redis compare-and-swap', () => {
     }
   });
 
+  it('sets a ~24h TTL on the Redis hash once closed, leaving it with none while live', async () => {
+    const liveTtl = await redis.ttl(`auction:${auctionId}`);
+    expect(liveTtl).toBe(-1); // -1 = key exists, no TTL set
+
+    await markAuctionClosed(auctionId);
+    const closedTtl = await redis.ttl(`auction:${auctionId}`);
+    expect(closedTtl).toBeGreaterThan(0);
+    expect(closedTtl).toBeLessThanOrEqual(24 * 60 * 60);
+  });
+
   it('resets the countdown window on an accepted bid, up to the extension cap', async () => {
     const before = await getAuctionState(auctionId);
     await new Promise((resolve) => setTimeout(resolve, 50));

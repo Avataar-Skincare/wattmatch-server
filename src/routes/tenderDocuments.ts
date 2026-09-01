@@ -7,7 +7,9 @@ import { TenderInvitation } from '../models/TenderInvitation.js';
 import { TenderDocumentField, type DocumentEnvelope } from '../models/TenderDocumentField.js';
 import { TenderDocumentUpload } from '../models/TenderDocumentUpload.js';
 import { VettingOpeningAttestation } from '../models/VettingOpeningAttestation.js';
-import { uploadObject, getSignedDownloadUrl } from '../lib/s3.js';
+import { DefaultTenderDocumentTemplate } from '../models/DefaultTenderDocumentTemplate.js';
+import { DEFAULT_FIELDS } from '../services/defaultTenderDocumentFields.js';
+import { uploadObject, deleteObject, getSignedDownloadUrl } from '../lib/s3.js';
 import { authRequired } from '../middleware/auth.js';
 import { logger } from '../lib/logger.js';
 
@@ -35,8 +37,8 @@ const upload = multer({
   },
 });
 
-const readLimiter = rateLimit({ windowMs: 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false });
-const writeLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false });
+const readLimiter = rateLimit({ name: 'tenderDocuments:read', windowMs: 60 * 1000, limit: 60 });
+const writeLimiter = rateLimit({ name: 'tenderDocuments:write', windowMs: 15 * 60 * 1000, limit: 60 });
 
 // This endpoint is always multipart (see the POST route below), so `required` always arrives as
 // the literal string "true"/"false", never a real boolean — z.coerce.boolean() would coerce via
@@ -44,6 +46,12 @@ const writeLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 60, standardHe
 // Preprocessing to compare against the literal string first is what actually respects an
 // admin-unchecked "Required" checkbox instead of always saving the field as required.
 const stringBoolean = z.preprocess((v) => (typeof v === 'string' ? v === 'true' : v), z.boolean());
+
+// Asked on every per-tender template upload (see the /template route below): does this replace the
+// format for THIS tender only, or should it also become the platform-wide default every future
+// tender starts with? Defaults to false — uploading a one-off format for a single tender should
+// never silently change what every other tender gets.
+const templateUploadBodySchema = z.object({ setAsDefault: stringBoolean.optional().default(false) });
 
 const addFieldBodySchema = z.object({
   envelope: z.enum(['technical', 'financial']),
@@ -64,6 +72,97 @@ function s3KeyForTemplate(tenderId: number, fieldId: number, filename: string): 
 function s3KeyForUpload(tenderId: number, fieldId: number, organizationId: number, filename: string): string {
   return `tender-documents/${tenderId}/uploads/${fieldId}-org${organizationId}-${Date.now()}-${filename}`;
 }
+
+function s3KeyForDefaultTemplate(key: string, filename: string): string {
+  return `tender-documents/_defaults/${key}-${Date.now()}-${filename}`;
+}
+
+// Platform-wide blank-format templates for the fixed DEFAULT_FIELDS checklist (see
+// defaultTenderDocumentFields.ts) — upload one here and every subsequently created tender's
+// TenderDocumentField row for that key starts pre-filled with it (seedDefaultDocumentFields), no
+// per-tender re-upload needed. This never touches any already-created tender's own field row —
+// those keep whatever template they were seeded with (or were later given via the per-tender
+// POST /tenders/:id/document-fields/:fieldId/template route above, which still works exactly the
+// same for one-off overrides on a specific tender).
+router.get('/default-document-templates', readLimiter, ...authRequired('admin'), async (_req, res, next) => {
+  try {
+    const defaults = await DefaultTenderDocumentTemplate.findAll();
+    const defaultByKey = new Map(defaults.map((d) => [d.key, d]));
+
+    res.json({
+      success: true,
+      templates: await Promise.all(
+        DEFAULT_FIELDS.map(async (f) => {
+          const d = defaultByKey.get(f.key);
+          return {
+            envelope: f.envelope,
+            key: f.key,
+            label: f.label,
+            hasTemplate: Boolean(d),
+            templateOriginalFilename: d?.templateOriginalFilename ?? null,
+            templateUrl: d ? await getSignedDownloadUrl(d.templateS3Key) : null,
+          };
+        })
+      ),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Upload or replace the default template for one checklist key. Deliberately does not delete the
+// previous default's S3 object (if any) — unlike a fresh per-tender upload, this object may already
+// be referenced by every tender seeded before this replacement, so deleting it here would break
+// their "View format" links. The orphaned-object cleanup below only ever applies to the file this
+// request itself just uploaded, for the case where the DB write right after fails.
+router.post('/default-document-templates/:key/template', writeLimiter, ...authRequired('admin'), upload.single('template'), async (req, res, next) => {
+  try {
+    const key = req.params.key;
+    const defaultField = DEFAULT_FIELDS.find((f) => f.key === key);
+    if (!defaultField) return res.status(404).json({ success: false, error: `"${key}" is not a recognized default checklist key` });
+
+    if (!req.file) return res.status(400).json({ success: false, error: 'A PDF template file is required' });
+
+    const templateS3Key = s3KeyForDefaultTemplate(key, req.file.originalname);
+    await uploadObject(templateS3Key, req.file.buffer, 'application/pdf');
+
+    try {
+      await DefaultTenderDocumentTemplate.upsert({
+        envelope: defaultField.envelope,
+        key,
+        templateS3Key,
+        templateOriginalFilename: req.file.originalname,
+      });
+    } catch (err) {
+      await deleteObject(templateS3Key).catch((cleanupErr) =>
+        logger.error({ err: cleanupErr, templateS3Key }, '[TENDER_DOCS] failed to clean up orphaned default template upload')
+      );
+      throw err;
+    }
+
+    logger.info({ reqId: req.requestId, key }, '[TENDER_DOCS] default template set');
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Removes the default for one key so future tenders seed with no template for it again — same
+// "doesn't touch already-created tenders" reasoning as above, so no S3 cleanup here either.
+router.delete('/default-document-templates/:key/template', writeLimiter, ...authRequired('admin'), async (req, res, next) => {
+  try {
+    const key = req.params.key;
+    const deleted = await DefaultTenderDocumentTemplate.destroy({ where: { key } });
+    if (!deleted) return res.status(404).json({ success: false, error: `No default template set for "${key}"` });
+
+    logger.info({ reqId: req.requestId, key }, '[TENDER_DOCS] default template removed');
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // Admin manages every tender's document checklist (buyers have no operational role here at all —
 // they register and submit a tender request, WattMatch's own team runs everything from there), or
@@ -94,20 +193,36 @@ router.get('/tenders/:id/document-fields', readLimiter, ...authRequired(), async
     const visibility = await requireTenderVisibility(tenderId, req.org!);
     if (!visibility.ok) return res.status(visibility.status).json({ success: false, error: visibility.error });
 
-    const fields = await TenderDocumentField.findAll({ where: { tenderId }, order: [['sortOrder', 'ASC']] });
+    const [fields, defaults] = await Promise.all([
+      TenderDocumentField.findAll({ where: { tenderId }, order: [['sortOrder', 'ASC']] }),
+      DefaultTenderDocumentTemplate.findAll(),
+    ]);
+    const defaultByKey = new Map(defaults.map((d) => [d.key, d]));
 
     res.json({
       success: true,
       fields: await Promise.all(
-        fields.map(async (f) => ({
-          id: f.id,
-          envelope: f.envelope,
-          key: f.key,
-          label: f.label,
-          required: f.required,
-          hasTemplate: f.templateS3Key !== null,
-          templateUrl: f.templateS3Key ? await getSignedDownloadUrl(f.templateS3Key) : null,
-        }))
+        fields.map(async (f) => {
+          const platformDefault = defaultByKey.get(f.key);
+          // Tells the admin UI what to ask before an upload: "isDefault" means this field is
+          // currently showing the platform-wide format (so a reupload should ask whether to also
+          // update that default); "custom" means this tender already has its own one-off format (or
+          // this key isn't part of the default checklist at all — see DEFAULT_FIELDS); "none" means
+          // no template has ever been attached.
+          const templateSource: 'none' | 'default' | 'custom' =
+            f.templateS3Key === null ? 'none' : f.templateS3Key === platformDefault?.templateS3Key ? 'default' : 'custom';
+          return {
+            id: f.id,
+            envelope: f.envelope,
+            key: f.key,
+            label: f.label,
+            required: f.required,
+            hasTemplate: f.templateS3Key !== null,
+            templateUrl: f.templateS3Key ? await getSignedDownloadUrl(f.templateS3Key) : null,
+            templateSource,
+            canSetAsDefault: DEFAULT_FIELDS.some((d) => d.key === f.key),
+          };
+        })
       ),
     });
   } catch (err) {
@@ -146,16 +261,25 @@ router.post('/tenders/:id/document-fields', writeLimiter, ...authRequired('admin
       await uploadObject(templateS3Key, req.file.buffer, 'application/pdf');
     }
 
-    const field = await TenderDocumentField.create({
-      tenderId,
-      envelope: parsed.data.envelope as DocumentEnvelope,
-      key: parsed.data.key,
-      label: parsed.data.label,
-      required: parsed.data.required,
-      templateS3Key,
-      templateOriginalFilename,
-      sortOrder: (maxSortOrder ?? -1) + 1,
-    });
+    let field: TenderDocumentField;
+    try {
+      field = await TenderDocumentField.create({
+        tenderId,
+        envelope: parsed.data.envelope as DocumentEnvelope,
+        key: parsed.data.key,
+        label: parsed.data.label,
+        required: parsed.data.required,
+        templateS3Key,
+        templateOriginalFilename,
+        sortOrder: (maxSortOrder ?? -1) + 1,
+      });
+    } catch (err) {
+      // The upload above already succeeded — without this, a DB failure here leaves an orphaned
+      // object in S3 with nothing ever referencing or cleaning it up. Best-effort: a failure to
+      // delete isn't worth obscuring the original error over.
+      if (templateS3Key) await deleteObject(templateS3Key).catch((cleanupErr) => logger.error({ err: cleanupErr, templateS3Key }, '[TENDER_DOCS] failed to clean up orphaned template upload'));
+      throw err;
+    }
 
     logger.info({ reqId: req.requestId, tenderId, fieldId: field.id, key: field.key }, '[TENDER_DOCS] field added');
 
@@ -203,7 +327,16 @@ router.patch('/tenders/:id/document-fields/:fieldId', writeLimiter, ...authRequi
 // Admin-only: upload or swap out a field's blank-format template PDF without deleting/re-adding the
 // field itself (which would cascade away any bidder uploads already made against it, per the DELETE
 // route below). Separate from the template optionally attached on POST /document-fields, which only
-// covers the moment a field is first created — this is the "replace it later" path.
+// covers the moment a field is first created — this is the "replace it later" path. This is also the
+// exact same route used the very first time an admin fills in a checklist item that had no platform
+// default yet (right after tender creation) and when editing an already-live tender later — one
+// route covers both moments the admin can be at.
+//
+// setAsDefault (asked on every upload, see templateUploadBodySchema): whether this format should
+// also become the platform-wide default for this key going forward — the same file is referenced
+// from both this tender's field and DefaultTenderDocumentTemplate, no duplicate upload needed. Only
+// meaningful for a key that's part of the fixed DEFAULT_FIELDS checklist; a tender-specific custom
+// field (added via POST /document-fields) has no platform-wide default to set.
 router.post('/tenders/:id/document-fields/:fieldId/template', writeLimiter, ...authRequired('admin'), upload.single('template'), async (req, res, next) => {
   try {
     const tenderId = Number(req.params.id);
@@ -217,19 +350,50 @@ router.post('/tenders/:id/document-fields/:fieldId/template', writeLimiter, ...a
 
     if (!req.file) return res.status(400).json({ success: false, error: 'A PDF template file is required' });
 
+    const parsed = templateUploadBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, error: parsed.error.issues.map((i) => i.message).join('; ') });
+    }
+
     const field = await TenderDocumentField.findOne({ where: { id: fieldId, tenderId } });
     if (!field) return res.status(404).json({ success: false, error: 'Field not found for this tender' });
+
+    const isDefaultChecklistKey = DEFAULT_FIELDS.some((d) => d.key === field.key);
+    if (parsed.data.setAsDefault && !isDefaultChecklistKey) {
+      return res.status(400).json({
+        success: false,
+        error: `"${field.key}" is a custom field for this tender and has no platform-wide default to set`,
+      });
+    }
 
     const templateS3Key = s3KeyForTemplate(tenderId, fieldId, req.file.originalname);
     await uploadObject(templateS3Key, req.file.buffer, 'application/pdf');
 
-    field.templateS3Key = templateS3Key;
-    field.templateOriginalFilename = req.file.originalname;
-    await field.save();
+    try {
+      field.templateS3Key = templateS3Key;
+      field.templateOriginalFilename = req.file.originalname;
+      await field.save();
+      if (parsed.data.setAsDefault) {
+        await DefaultTenderDocumentTemplate.upsert({
+          envelope: field.envelope,
+          key: field.key,
+          templateS3Key,
+          templateOriginalFilename: req.file.originalname,
+        });
+      }
+    } catch (err) {
+      // Same reasoning as POST /document-fields above — clean up the object the upload just wrote
+      // rather than leave it orphaned with nothing referencing it.
+      await deleteObject(templateS3Key).catch((cleanupErr) => logger.error({ err: cleanupErr, templateS3Key }, '[TENDER_DOCS] failed to clean up orphaned template upload'));
+      throw err;
+    }
 
-    logger.info({ reqId: req.requestId, tenderId, fieldId }, '[TENDER_DOCS] field template replaced');
+    logger.info(
+      { reqId: req.requestId, tenderId, fieldId, setAsDefault: parsed.data.setAsDefault },
+      '[TENDER_DOCS] field template replaced'
+    );
 
-    res.json({ success: true });
+    res.json({ success: true, setAsDefault: parsed.data.setAsDefault });
   } catch (err) {
     next(err);
   }
@@ -288,14 +452,22 @@ router.post('/tenders/:id/document-fields/:fieldId/upload', writeLimiter, ...aut
     const s3Key = s3KeyForUpload(tenderId, fieldId, req.org!.id, req.file.originalname);
     await uploadObject(s3Key, req.file.buffer, 'application/pdf');
 
-    const [uploadRow] = await TenderDocumentUpload.upsert({
-      tenderId,
-      organizationId: req.org!.id,
-      fieldId,
-      s3Key,
-      originalFilename: req.file.originalname,
-      sizeBytes: req.file.size,
-    });
+    let uploadRow: TenderDocumentUpload;
+    try {
+      [uploadRow] = await TenderDocumentUpload.upsert({
+        tenderId,
+        organizationId: req.org!.id,
+        fieldId,
+        s3Key,
+        originalFilename: req.file.originalname,
+        sizeBytes: req.file.size,
+      });
+    } catch (err) {
+      // Same reasoning as the template-upload routes above — the object just landed in S3; don't
+      // leave it orphaned if the row that was supposed to reference it never got written.
+      await deleteObject(s3Key).catch((cleanupErr) => logger.error({ err: cleanupErr, s3Key }, '[TENDER_DOCS] failed to clean up orphaned document upload'));
+      throw err;
+    }
 
     logger.info(
       { reqId: req.requestId, tenderId, fieldId, organizationId: req.org!.id, uploadId: uploadRow.id },

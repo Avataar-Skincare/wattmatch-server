@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import { jsonRateLimit as rateLimit } from '../lib/rateLimit.js';
 import { z } from 'zod';
+import { UniqueConstraintError } from 'sequelize';
+import { sequelize } from '../db/sequelize.js';
 import { VettingBid } from '../models/VettingBid.js';
 import { VettingDecidedRecord } from '../models/VettingDecidedRecord.js';
 import { VettingOpeningAttestation } from '../models/VettingOpeningAttestation.js';
@@ -17,7 +19,7 @@ import { authRequired } from '../middleware/auth.js';
 
 const router = Router();
 
-const promoteLimiter = rateLimit({ windowMs: 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
+const promoteLimiter = rateLimit({ name: 'vettingAuctionBridge:promote', windowMs: 60 * 1000, limit: 10 });
 
 function frontendUrl(path: string): string {
   const origin = process.env.CORS_ORIGIN ?? 'http://localhost:5173';
@@ -66,23 +68,81 @@ async function seedAuctionStandalone(
   equityValue: number | null,
   totalUnitsPerYear: number | null
 ) {
-  // Same ordering rationale already established for the manual seed route: create 'scheduled',
-  // start the clock only once every participant has a real join link ready, flip to 'live' last.
-  const auction = await Auction.create({
-    title,
-    status: 'scheduled',
-    openingBid: String(openingBid),
-    currentLowestBid: String(openingBid),
-    windowSeconds: DEFAULT_WINDOW_SECONDS,
-    maxAutoExtensions: DEFAULT_MAX_AUTO_EXTENSIONS,
-    minUndercut: String(MIN_UNDERCUT),
-    tenderRef,
-    useLandedRate,
-    equityValue: equityValue !== null ? String(equityValue) : null,
-    totalUnitsPerYear: totalUnitsPerYear !== null ? String(totalUnitsPerYear) : null,
-    scheduledStartAt,
+  // Pre-compute every KMS-encrypted value before opening the transaction below — keeping external
+  // network calls (KMS, not MySQL) out of the transaction body means the DB connection isn't held
+  // open across however long those take, and a slow/flaky KMS call can't leave a transaction
+  // hanging open.
+  const encryptedParticipants = await Promise.all(
+    participants.map(async (p) => ({ ...p, encryptedOrgName: await encryptField(p.organizationName) }))
+  );
+  const encryptedSpectatorName = await encryptField('Wattmatch admin (spectator)');
+
+  // Transactional: previously Auction.create, each participant's AuctionParticipant.create, and the
+  // spectator seat's create were separate un-transacted writes — a failure partway (e.g. the 3rd
+  // participant insert throwing) left an orphaned, partially-seeded auction behind with no rollback.
+  // Same ordering rationale as before within the transaction: create 'scheduled' first, still flip
+  // to 'live' only later via activateScheduledAuction.
+  const { auction, createdParticipants, spectatorParticipant } = await sequelize.transaction(async (transaction) => {
+    const auction = await Auction.create(
+      {
+        title,
+        status: 'scheduled',
+        openingBid: String(openingBid),
+        currentLowestBid: String(openingBid),
+        windowSeconds: DEFAULT_WINDOW_SECONDS,
+        maxAutoExtensions: DEFAULT_MAX_AUTO_EXTENSIONS,
+        minUndercut: String(MIN_UNDERCUT),
+        tenderRef,
+        useLandedRate,
+        equityValue: equityValue !== null ? String(equityValue) : null,
+        totalUnitsPerYear: totalUnitsPerYear !== null ? String(totalUnitsPerYear) : null,
+        scheduledStartAt,
+      },
+      { transaction }
+    );
+
+    const createdParticipants: Array<{ participant: AuctionParticipant; generatorOrgId: number | null; alias: string }> = [];
+    for (const p of encryptedParticipants) {
+      const participant = await AuctionParticipant.create(
+        {
+          auctionId: auction.id,
+          organizationName: p.encryptedOrgName,
+          organizationId: p.generatorOrgId,
+          alias: p.alias,
+          role: 'generator',
+          joinTokenId: generateJti(),
+        },
+        { transaction }
+      );
+      createdParticipants.push({ participant, generatorOrgId: p.generatorOrgId, alias: p.alias });
+    }
+
+    // Whether the real buyer org should get a seat here at all is a pending product decision (would
+    // mean org-login-gated access via /auctions/:id/join, same as generators) — not decided yet, so
+    // not built here. In the meantime, this seat is a read-only spectator link for ADMIN's own use:
+    // no org login involved (a bearer token embedded directly in the link, same legacy mechanism
+    // auctionAdmin.ts's manual-seed buyer link already uses), just something admin can open to watch
+    // the real auction happen. It also happens to be a real AuctionParticipant with role 'buyer',
+    // which is what routes/auctions.ts's winner-identity reveal requires to exist at all — without
+    // this, the winning generator's own reveal call finds no buyer seat and 404s.
+    const spectatorParticipant = await AuctionParticipant.create(
+      {
+        auctionId: auction.id,
+        organizationName: encryptedSpectatorName,
+        alias: 'SPECTATOR',
+        role: 'buyer',
+        joinTokenId: generateJti(),
+      },
+      { transaction }
+    );
+
+    return { auction, createdParticipants, spectatorParticipant };
   });
 
+  // Everything below only runs once the auction and every one of its participant rows are durably
+  // committed together. Redis state and the join-link emails are deliberately outside the
+  // transaction — Redis isn't part of it, and emails/timers should only ever fire for an auction
+  // that's genuinely committed, not one still inside a transaction that could yet roll back.
   await initAuctionState(
     auction.id,
     openingBid,
@@ -99,51 +159,31 @@ async function seedAuctionStandalone(
   // same URL; it grants nothing on its own, so there's no reason to vary it per recipient.
   const joinPath = `/auction-live?auctionId=${auction.id}`;
 
-  const links = [];
-  for (const p of participants) {
-    const participant = await AuctionParticipant.create({
-      auctionId: auction.id,
-      organizationName: await encryptField(p.organizationName),
-      organizationId: p.generatorOrgId,
-      alias: p.alias,
-      role: 'generator',
-      joinTokenId: generateJti(),
-    });
-    links.push({ alias: p.alias, joinUrl: frontendUrl(joinPath), organizationId: participant.organizationId });
+  const links = createdParticipants.map(({ participant, alias }) => ({
+    alias,
+    joinUrl: frontendUrl(joinPath),
+    organizationId: participant.organizationId,
+  }));
 
+  for (const { generatorOrgId, alias } of createdParticipants) {
     // Stage 7: "Approved generators receive a scheduled auction link" — fire-and-forget, same as
     // invoiceService.ts's hook: a slow/broken email send must never delay the auction actually
     // going live for everyone else. generatorOrgId is null for placeholder/legacy submissions
     // (see VettingBid's own comment) — nothing to email in that case (and nothing they could join
     // with either, since /join requires a real org to log in as), skip silently rather than failing
     // the whole promotion over one missing link.
-    if (p.generatorOrgId !== null) {
-      Organization.findByPk(p.generatorOrgId)
+    if (generatorOrgId !== null) {
+      Organization.findByPk(generatorOrgId)
         .then((org) => {
           if (!org) return;
           return sendAuctionJoinLinkEmail(org.contactEmail, title, frontendUrl(joinPath), scheduledStartAt);
         })
         .catch((err) => {
-          logger.error({ err, auctionId: auction.id, generatorOrgId: p.generatorOrgId }, '[VETTING_BRIDGE] auction join-link email failed — auction unaffected');
+          logger.error({ err, auctionId: auction.id, generatorOrgId, alias }, '[VETTING_BRIDGE] auction join-link email failed — auction unaffected');
         });
     }
   }
 
-  // Whether the real buyer org should get a seat here at all is a pending product decision (would
-  // mean org-login-gated access via /auctions/:id/join, same as generators) — not decided yet, so
-  // not built here. In the meantime, this seat is a read-only spectator link for ADMIN's own use:
-  // no org login involved (a bearer token embedded directly in the link, same legacy mechanism
-  // auctionAdmin.ts's manual-seed buyer link already uses), just something admin can open to watch
-  // the real auction happen. It also happens to be a real AuctionParticipant with role 'buyer',
-  // which is what routes/auctions.ts's winner-identity reveal requires to exist at all — without
-  // this, the winning generator's own reveal call finds no buyer seat and 404s.
-  const spectatorParticipant = await AuctionParticipant.create({
-    auctionId: auction.id,
-    organizationName: await encryptField('Wattmatch admin (spectator)'),
-    alias: 'SPECTATOR',
-    role: 'buyer',
-    joinTokenId: generateJti(),
-  });
   const spectatorToken = await signJoinToken({
     auctionId: auction.id,
     participantId: spectatorParticipant.id,
@@ -226,9 +266,16 @@ router.post('/vetting-bids/:tenderRef/promote-to-auction', promoteLimiter, ...au
       return res.status(400).json({ success: false, error: 'No approved generators with opened financial bids to promote' });
     }
 
+    // One batched query instead of one findOne per approved bid inside the loop below — with a
+    // large approved-generator list this was a real N+1 (a separate DB round-trip per bid).
+    const decidedRecords = await VettingDecidedRecord.findAll({
+      where: { vettingBidId: approvedBids.map((b) => b.id), envelope: 'financial' },
+    });
+    const decidedRecordByBidId = new Map(decidedRecords.map((r) => [r.vettingBidId, r]));
+
     const participants: Array<{ alias: string; organizationName: string; tariff: number; generatorOrgId: number | null }> = [];
     for (const bid of approvedBids) {
-      const record = await VettingDecidedRecord.findOne({ where: { vettingBidId: bid.id, envelope: 'financial' } });
+      const record = decidedRecordByBidId.get(bid.id);
       if (!record) continue; // approved but financial envelope wasn't opened for this one — skip, don't fail the whole promotion
       const content = await decryptField(record.encryptedContent);
       let tariff: number;
@@ -251,16 +298,28 @@ router.post('/vetting-bids/:tenderRef/promote-to-auction', promoteLimiter, ...au
 
     const openingBid = Math.min(...participants.map((p) => p.tariff));
 
-    const result = await seedAuctionStandalone(
-      `Tender #${tenderRef} auction`,
-      openingBid,
-      participants.map((p) => ({ alias: p.alias, organizationName: p.organizationName, generatorOrgId: p.generatorOrgId })),
-      tenderRef,
-      scheduledStartAt,
-      tender.useLandedRate,
-      tender.equityValue !== null ? Number(tender.equityValue) : null,
-      tender.totalUnitsPerYear !== null ? Number(tender.totalUnitsPerYear) : null
-    );
+    let result;
+    try {
+      result = await seedAuctionStandalone(
+        `Tender #${tenderRef} auction`,
+        openingBid,
+        participants.map((p) => ({ alias: p.alias, organizationName: p.organizationName, generatorOrgId: p.generatorOrgId })),
+        tenderRef,
+        scheduledStartAt,
+        tender.useLandedRate,
+        tender.equityValue !== null ? Number(tender.equityValue) : null,
+        tender.totalUnitsPerYear !== null ? Number(tender.totalUnitsPerYear) : null
+      );
+    } catch (err) {
+      // Backstop for the findOne-based double-promotion guard above, which two concurrent
+      // promote-to-auction calls for the same tender could both pass — the unique index on
+      // Auction.tenderRef is what actually prevents the second row; this just turns that into the
+      // same clean 409 the findOne check already returns for the non-racing case.
+      if (err instanceof UniqueConstraintError) {
+        return res.status(409).json({ success: false, error: 'This tender was already promoted to auction (concurrent request)' });
+      }
+      throw err;
+    }
 
     logger.info(
       { reqId: req.requestId, tenderRef, auctionId: result.auctionId, participantCount: participants.length, openingBid },

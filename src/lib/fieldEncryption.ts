@@ -30,6 +30,17 @@ const DEV_ONLY_INSECURE_KEY = crypto.createHash('sha256').update('dev-only-insec
 function getLocalKey(): Buffer {
   const configured = process.env.FIELD_ENCRYPTION_KEY;
   if (configured) return crypto.createHash('sha256').update(configured).digest();
+  // Same production gate as secrets.ts's loadRequiredSecret and orgAuth.ts's JWT secret — an
+  // insecure, publicly-known default is fine for local dev, but must never silently activate in
+  // production. This matters more here than for most secrets: the local scheme has no
+  // key-versioning at all (see localDecrypt's own comment), so if this fallback were ever used in
+  // production and FIELD_ENCRYPTION_KEY later got set for real, every row encrypted under the
+  // insecure default in between would become permanently undecryptable. Failing loudly here forces
+  // a real KMS key (FIELD_ENCRYPTION_KMS_KEY_ID) or an explicit FIELD_ENCRYPTION_KEY before any
+  // production traffic can reach this path at all.
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('FIELD_ENCRYPTION_KEY is not set in production — refusing to fall back to the insecure dev-only default.');
+  }
   logger.warn('FIELD_ENCRYPTION_KEY is not set — falling back to an insecure dev-only default. Set it before any real test.');
   return DEV_ONLY_INSECURE_KEY;
 }

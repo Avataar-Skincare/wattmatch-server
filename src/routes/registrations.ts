@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { jsonRateLimit as rateLimit } from '../lib/rateLimit.js';
 import { GeneratorRegistration } from '../models/GeneratorRegistration.js';
 import { CIRegistration } from '../models/CIRegistration.js';
 import { Organization } from '../models/Organization.js';
@@ -12,6 +13,12 @@ import { isValidEmail, isValidPhone, isPositiveNumber, normalizePhone } from '..
 const router = Router();
 
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000; // matches organizations.ts's own TTL for this token purpose
+
+// Public, unauthenticated lead-capture forms — unlike every other route file in this codebase, these
+// had no rate limiting at all. Each call writes a DB row and fires two emails (a confirmation and,
+// for a new account, a set-password email), so with no limiter this was wide open to spam/flooding/
+// email-bombing. Same bound as organizations.ts's own registerLimiter.
+const registerLimiter = rateLimit({ name: 'registrations:register', windowMs: 15 * 60 * 1000, limit: 30 });
 
 function frontendUrl(path: string): string {
   const origin = process.env.CORS_ORIGIN ?? 'http://localhost:5173';
@@ -57,7 +64,7 @@ async function createAccountAndSendSetPasswordEmail(
   return org;
 }
 
-router.post('/generator', async (req, res) => {
+router.post('/generator', registerLimiter, async (req, res) => {
   try {
     const { name, company, email, phone, state, capacity, siteLocation, commissioningTimeline, certifications, message } = req.body;
     if (!email || !phone) {
@@ -86,7 +93,7 @@ router.post('/generator', async (req, res) => {
   }
 });
 
-router.post('/ci', async (req, res) => {
+router.post('/ci', registerLimiter, async (req, res) => {
   try {
     const { name, company, email, phone, state, load, siteLocation, targetCapacity, tenurePreference, message, consent } = req.body;
     if (!email || !phone) {

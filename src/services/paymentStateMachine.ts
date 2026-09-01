@@ -1,4 +1,4 @@
-import type { Payment, PaymentStatus } from '../models/Payment.js';
+import { Payment, type PaymentStatus } from '../models/Payment.js';
 import { Tender } from '../models/Tender.js';
 import { generateInvoiceForPayment } from './invoiceService.js';
 import { sendTenderDocumentEmail } from './email.js';
@@ -16,9 +16,19 @@ import { logger } from '../lib/logger.js';
 const LEGAL_TRANSITIONS: Record<PaymentStatus, PaymentStatus[]> = {
   created: ['attempted', 'paid', 'failed'],
   attempted: ['paid', 'failed'],
-  paid: ['refunded'],
-  failed: [],
+  paid: ['refunded', 'partially_refunded'],
+  // 'failed' -> 'paid' exists for one specific case: /payment/verify's own HMAC check locally
+  // marking a payment 'failed' before Razorpay's later, authoritative payment.captured webhook
+  // arrives for the same (actually successful) payment. Without this, that webhook's own call to
+  // transitionPayment would be silently rejected as illegal, permanently stranding a real payment
+  // as "failed" with no recovery path — see paymentWebhookService.ts's processPaymentCaptured. Safe
+  // to allow because the only caller that can reach 'paid' is the webhook path, itself gated on
+  // verifyWebhookSignature — a client can't trigger this transition by simply re-calling /verify
+  // (that route already rejects outright on a 'failed' status; see its own comment).
+  failed: ['paid'],
   refunded: [],
+  // A partial refund can be topped up by a further (partial or full) refund.
+  partially_refunded: ['refunded', 'partially_refunded'],
 };
 
 // A pure lookup, deliberately with NO same-state special case: from === to is a no-op, not a
@@ -53,7 +63,22 @@ export async function transitionPayment(
     return { applied: false, reason: `illegal transition: ${from} -> ${to}` };
   }
 
-  await payment.update({ status: to, ...extra });
+  // Atomic and conditional on the DB row still being in `from` — not a plain instance.update(),
+  // which issues an unconditional `WHERE id = :id` and would let two concurrent deliveries of the
+  // same webhook event (Razorpay's API explicitly allows duplicate/at-least-once delivery) both
+  // pass the isLegalTransition check above off the same in-memory `from`, then both apply, firing
+  // the "paid" side effects (invoice generation, confirmation email) twice. The `WHERE status =
+  // :from` clause means only whichever caller's UPDATE actually lands first affects a row; the
+  // loser's affectedCount is 0, so it correctly reports back "not applied" instead of repeating a
+  // side effect that already happened.
+  const [affectedCount] = await Payment.update({ status: to, ...extra }, { where: { id: payment.id, status: from } });
+  if (affectedCount === 0) {
+    logger.warn({ paymentId: payment.id, from, to }, '[PAYMENT_STATE] lost the race to a concurrent transition — not applied');
+    return { applied: false, reason: 'concurrent transition already applied' };
+  }
+  payment.status = to;
+  if (extra.razorpayPaymentId !== undefined) payment.razorpayPaymentId = extra.razorpayPaymentId;
+  if (extra.razorpaySignature !== undefined) payment.razorpaySignature = extra.razorpaySignature;
   logger.info({ paymentId: payment.id, from, to }, '[PAYMENT_STATE] transitioned');
 
   // Fire-and-forget, deliberately not awaited: invoice generation (Red Flag #6 in
@@ -78,6 +103,61 @@ export async function transitionPayment(
   }
 
   return { applied: true };
+}
+
+// A refund can be confirmed through two independent paths — refundPayment's own synchronous
+// 'processed' response from Razorpay, and the refund.processed webhook, which Razorpay may or may
+// not also send for the same refund (see paymentRefundService.ts's own comment on why the
+// synchronous path can't just be removed in favor of always waiting for the webhook). Both paths
+// call this instead of transitioning straight to 'refunded', for two reasons: a partial refund must
+// not land on the terminal 'refunded' status (blocking any further refund on the same payment), and
+// the same physical refund must not have its amount counted twice if both paths fire for it.
+// `notes.appliedRefundIds` is the de-dup guard — a lightweight log of which Razorpay refund ids have
+// already been reflected in amountRefundedPaise, since Payment has no separate refunds table.
+const APPLY_REFUND_MAX_ATTEMPTS = 5;
+
+export async function applyRefundAmount(payment: Payment, refundId: string, amountPaise: number): Promise<TransitionResult> {
+  let current = payment;
+
+  for (let attempt = 0; attempt < APPLY_REFUND_MAX_ATTEMPTS; attempt++) {
+    const notes = (current.notes ?? {}) as Record<string, unknown>;
+    const appliedRefundIds = Array.isArray(notes.appliedRefundIds) ? (notes.appliedRefundIds as string[]) : [];
+    if (appliedRefundIds.includes(refundId)) {
+      logger.info({ paymentId: current.id, refundId }, '[PAYMENT_STATE] refund already applied — ignoring duplicate confirmation');
+      return { applied: false, reason: 'refund already applied' };
+    }
+
+    const fromAmountRefundedPaise = current.amountRefundedPaise;
+    const amountRefundedPaise = fromAmountRefundedPaise + amountPaise;
+    const nextNotes = { ...notes, appliedRefundIds: [...appliedRefundIds, refundId] };
+
+    // Atomic and conditional on amountRefundedPaise still matching what was just read — the same
+    // reasoning as transitionPayment's `WHERE status = :from` above. A plain payment.update() here
+    // would let two refunds confirmed concurrently for the same payment (two distinct partial
+    // refunds, or this same refund's synchronous confirmation racing its own later webhook) both
+    // read the same starting amount and have the second write silently clobber the first's
+    // contribution — losing real refunded money from the ledger — instead of the second one
+    // detecting the race and retrying against the row's actual current state.
+    const [affectedCount] = await Payment.update(
+      { amountRefundedPaise, notes: nextNotes },
+      { where: { id: current.id, amountRefundedPaise: fromAmountRefundedPaise } }
+    );
+
+    if (affectedCount > 0) {
+      current.amountRefundedPaise = amountRefundedPaise;
+      current.notes = nextNotes;
+      const to: PaymentStatus = amountRefundedPaise >= current.amountPaise ? 'refunded' : 'partially_refunded';
+      return transitionPayment(current, to);
+    }
+
+    logger.warn({ paymentId: current.id, refundId, attempt }, '[PAYMENT_STATE] lost the race updating amountRefundedPaise — retrying against fresh state');
+    const fresh = await Payment.findByPk(current.id);
+    if (!fresh) return { applied: false, reason: 'payment no longer exists' };
+    current = fresh;
+  }
+
+  logger.error({ paymentId: current.id, refundId }, '[PAYMENT_STATE] applyRefundAmount exhausted retries under contention — refund not applied');
+  return { applied: false, reason: 'exhausted retries under contention' };
 }
 
 async function sendRfsDocumentEmailForPayment(payment: Payment): Promise<void> {

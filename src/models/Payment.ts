@@ -2,7 +2,7 @@ import { DataTypes, Model, type CreationOptional, type InferAttributes, type Inf
 import { sequelize } from '../db/sequelize.js';
 
 export type PaymentPurpose = 'rfs_document' | 'bid_processing';
-export type PaymentStatus = 'created' | 'attempted' | 'paid' | 'failed' | 'refunded';
+export type PaymentStatus = 'created' | 'attempted' | 'paid' | 'failed' | 'refunded' | 'partially_refunded';
 
 // One model for both remaining real online-payment fee types, distinguished by `purpose` rather
 // than one row shape per fee — they share every field that actually matters (amount, order/payment
@@ -41,6 +41,11 @@ export class Payment extends Model<InferAttributes<Payment>, InferCreationAttrib
   declare amountPaise: number;
   declare currency: string;
   declare status: CreationOptional<PaymentStatus>;
+  // Running total of what's actually been refunded so far (Razorpay confirms each refund's own
+  // amount independently) — the only way to tell a partial refund from a full one, since a single
+  // refund call's amountPaise may cover only part of amountPaise. Compared against amountPaise to
+  // decide status: 'refunded' (fully covered) vs 'partially_refunded' (more can still be refunded).
+  declare amountRefundedPaise: CreationOptional<number>;
 
   // Free-form context (e.g. which VettingBid an EMD payment secures) — deliberately untyped, same
   // role as the general prompt's Mongoose `notes: Mixed` field, expressed as a JSON column since
@@ -73,10 +78,11 @@ Payment.init(
     amountPaise: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false },
     currency: { type: DataTypes.STRING, allowNull: false },
     status: {
-      type: DataTypes.ENUM('created', 'attempted', 'paid', 'failed', 'refunded'),
+      type: DataTypes.ENUM('created', 'attempted', 'paid', 'failed', 'refunded', 'partially_refunded'),
       allowNull: false,
       defaultValue: 'created',
     },
+    amountRefundedPaise: { type: DataTypes.INTEGER.UNSIGNED, allowNull: false, defaultValue: 0 },
 
     notes: { type: DataTypes.JSON, allowNull: true },
 

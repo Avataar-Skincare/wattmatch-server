@@ -1,6 +1,6 @@
 import { Payment } from '../models/Payment.js';
 import { refund as razorpayRefund } from '../lib/razorpayAdapter.js';
-import { transitionPayment } from './paymentStateMachine.js';
+import { applyRefundAmount } from './paymentStateMachine.js';
 import { logger } from '../lib/logger.js';
 
 export type RefundOutcome =
@@ -12,8 +12,10 @@ export type RefundOutcome =
 // now a document, not money (see EmdSubmission.ts) — this is the only real-money refund path left.
 // Extracted from routes/payments.ts, behavior unchanged.
 export async function refundPayment(payment: Payment, amountPaise?: number): Promise<RefundOutcome> {
-  if (payment.status !== 'paid') {
-    return { ok: false, reason: 'not_paid', message: `Cannot refund a payment in status '${payment.status}' — only a paid payment can be refunded` };
+  // 'partially_refunded' is refundable too — a payment only becomes fully 'refunded' (terminal)
+  // once its cumulative refunded amount actually covers amountPaise (see applyRefundAmount).
+  if (payment.status !== 'paid' && payment.status !== 'partially_refunded') {
+    return { ok: false, reason: 'not_paid', message: `Cannot refund a payment in status '${payment.status}' — only a paid or partially refunded payment can be refunded` };
   }
   if (!payment.razorpayPaymentId) {
     // Should be unreachable (status is only ever 'paid' alongside a recorded payment id), but a
@@ -35,13 +37,14 @@ export async function refundPayment(payment: Payment, amountPaise?: number): Pro
 
   await payment.update({ razorpayRefundId: result.refundId });
 
-  // Instant refunds (most methods) come back already 'processed' — transition right away rather
-  // than waiting on a webhook that, for these, may never meaningfully add information. Pending
-  // refunds (some bank-transfer methods) stay 'paid' until the refund.processed webhook confirms
-  // completion — transitionPayment's own idempotency means whichever path fires first wins and the
-  // other is a safe no-op.
+  // Instant refunds (most methods) come back already 'processed' — apply the amount right away
+  // rather than waiting on a webhook that, for these, may never meaningfully add information.
+  // Pending refunds (some bank-transfer methods) are left unapplied until the refund.processed
+  // webhook confirms completion — applyRefundAmount's own de-dup guard means whichever path
+  // eventually fires for this refund id is the one that counts, and a second delivery is a safe
+  // no-op either way.
   if (result.status === 'processed') {
-    await transitionPayment(payment, 'refunded');
+    await applyRefundAmount(payment, result.refundId, result.amountPaise);
   }
 
   logger.info(

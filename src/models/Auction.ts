@@ -92,5 +92,11 @@ Auction.init(
     sequelize,
     tableName: 'wattmatch_auctions',
     underscored: true,
+    // Backs "a tender can only ever be promoted to a live auction once" at the DB level — previously
+    // only an application-level findOne-before-create check in vettingAuctionBridge.ts, which two
+    // concurrent promote-to-auction calls could both pass, creating two live auctions for the same
+    // tender. NULL tenderRef (every manually-seeded demo auction, auctionAdmin.ts) is exempt: MySQL
+    // treats each NULL as distinct in a unique index.
+    indexes: [{ unique: true, fields: ['tender_ref'] }],
   }
 );

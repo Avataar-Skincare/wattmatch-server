@@ -2,7 +2,8 @@ import { Router } from 'express';
 import { jsonRateLimit as rateLimit } from '../lib/rateLimit.js';
 import { z } from 'zod';
 import crypto from 'node:crypto';
-import { Op } from 'sequelize';
+import { Op, UniqueConstraintError } from 'sequelize';
+import { sequelize } from '../db/sequelize.js';
 import { VettingBid } from '../models/VettingBid.js';
 import { VettingOpeningAttestation, type VettingEnvelope } from '../models/VettingOpeningAttestation.js';
 import { VettingDecidedRecord } from '../models/VettingDecidedRecord.js';
@@ -60,9 +61,9 @@ const openedContentQuerySchema = z.object({ envelope: z.enum(['technical', 'fina
 // list/decided-record/opened views here stay admin-only (authRequired('admin')); public-keys is
 // any-authenticated-org since the keys aren't secret, but gating it removes anonymous surface area
 // for free — there's no legitimate anonymous caller.
-const submitLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false });
-const decisionLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
-const readLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
+const submitLimiter = rateLimit({ name: 'vettingBids:submit', windowMs: 15 * 60 * 1000, limit: 60 });
+const decisionLimiter = rateLimit({ name: 'vettingBids:decision', windowMs: 60 * 1000, limit: 30 });
+const readLimiter = rateLimit({ name: 'vettingBids:read', windowMs: 60 * 1000, limit: 30 });
 
 function getTechnicalKeyConfig() {
   const publicKeyPem = process.env.VETTING_TECHNICAL_PUBLIC_KEY_PEM;
@@ -175,19 +176,31 @@ router.post('/vetting-bids', submitLimiter, ...authRequired('generator'), async 
     const technicalCiphertextHash = crypto.createHash('sha256').update(technical.ciphertext).digest('hex');
     const financialCiphertextHash = crypto.createHash('sha256').update(financial.ciphertext).digest('hex');
 
-    const bid = await VettingBid.create({
-      tenderRef,
-      applicantAlias: generatorOrg.name,
-      generatorOrgId: generatorOrg.id,
-      technicalWrappedKey: technical.wrappedDataKey,
-      technicalIv: technical.iv,
-      technicalCiphertext: technical.ciphertext,
-      technicalCiphertextHash,
-      financialWrappedKey: financial.wrappedDataKey,
-      financialIv: financial.iv,
-      financialCiphertext: financial.ciphertext,
-      financialCiphertextHash,
-    });
+    let bid: VettingBid;
+    try {
+      bid = await VettingBid.create({
+        tenderRef,
+        applicantAlias: generatorOrg.name,
+        generatorOrgId: generatorOrg.id,
+        technicalWrappedKey: technical.wrappedDataKey,
+        technicalIv: technical.iv,
+        technicalCiphertext: technical.ciphertext,
+        technicalCiphertextHash,
+        financialWrappedKey: financial.wrappedDataKey,
+        financialIv: financial.iv,
+        financialCiphertext: financial.ciphertext,
+        financialCiphertextHash,
+      });
+    } catch (err) {
+      // Backstop for the findOne-then-create check above, which two near-simultaneous submissions
+      // from the same generator could both pass — the unique index on (tender_ref,
+      // generator_org_id) is what actually prevents the second row, this just turns that into the
+      // same clean 409 the findOne check already returns for the non-racing case.
+      if (err instanceof UniqueConstraintError) {
+        return res.status(409).json({ success: false, error: 'You have already submitted a bid for this tender' });
+      }
+      throw err;
+    }
 
     logger.info({ reqId: req.requestId, tenderRef, bidId: bid.id }, '[VETTING] bid submitted');
 
@@ -227,14 +240,21 @@ router.post('/vetting-bids/:id/technical-decision', decisionLimiter, ...authRequ
       return res.status(409).json({ success: false, error: 'No technical ceremony has been run for this tender yet — cannot record a decision on unopened content' });
     }
 
-    await bid.update({ technicalStatus: decision });
-
+    // Encrypt outside the transaction — it's a pure KMS call with no DB dependency, and there's no
+    // reason to hold a transaction open across a network round-trip to KMS.
+    const encryptedContent = await encryptField(reviewedContent);
     const decidedAt = new Date();
-    await VettingDecidedRecord.create({
-      vettingBidId: bid.id,
-      envelope: 'technical',
-      encryptedContent: await encryptField(reviewedContent),
-      decidedAt,
+
+    // Transactional: previously two separate un-transacted writes — if VettingDecidedRecord.create
+    // failed after bid.update succeeded, the bid's technicalStatus would flip to approved/rejected
+    // with no decided-record ever created, even though a rejected generator disputing that decision
+    // needs the record to exist (see this route's own comment above).
+    await sequelize.transaction(async (transaction) => {
+      await bid.update({ technicalStatus: decision }, { transaction });
+      await VettingDecidedRecord.create(
+        { vettingBidId: bid.id, envelope: 'technical', encryptedContent, decidedAt },
+        { transaction }
+      );
     });
 
     // EMD is a physical Bank Guarantee now, not money (see EmdSubmission) — a technical rejection

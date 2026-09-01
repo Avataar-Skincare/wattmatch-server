@@ -17,7 +17,11 @@ router.post('/ci', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Enter a valid email address' });
     }
     if (!isValidPhone(phone)) {
-      console.warn(`Lead for ${email} has an unrecognised phone number: ${phone}`);
+      // Previously just warned and proceeded — normalizePhone's own fallback for unparseable input
+      // is a "best-effort digit strip," so an invalid number was silently persisted as whatever
+      // that stripped down to, consistent with nothing (same bar the email check right above this
+      // already applies).
+      return res.status(400).json({ success: false, error: 'Enter a valid phone number' });
     }
     const { countryCode, number } = normalizePhone(phone);
     const lead = await CILead.create({ name, company, email, phone: number, phoneCountryCode: countryCode, state, load, message });
@@ -39,7 +43,11 @@ router.post('/generator', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Enter a valid email address' });
     }
     if (!isValidPhone(phone)) {
-      console.warn(`Lead for ${email} has an unrecognised phone number: ${phone}`);
+      // Previously just warned and proceeded — normalizePhone's own fallback for unparseable input
+      // is a "best-effort digit strip," so an invalid number was silently persisted as whatever
+      // that stripped down to, consistent with nothing (same bar the email check right above this
+      // already applies).
+      return res.status(400).json({ success: false, error: 'Enter a valid phone number' });
     }
     const { countryCode, number } = normalizePhone(phone);
     const lead = await GeneratorLead.create({ name, company, email, phone: number, phoneCountryCode: countryCode, state, capacity, message });

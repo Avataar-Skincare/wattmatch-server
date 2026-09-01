@@ -3,6 +3,7 @@ import { jsonRateLimit as rateLimit } from '../lib/rateLimit.js';
 import multer from 'multer';
 import { Op } from 'sequelize';
 import { z } from 'zod';
+import { sequelize } from '../db/sequelize.js';
 import { Tender } from '../models/Tender.js';
 import { Organization } from '../models/Organization.js';
 import { CIRegistration } from '../models/CIRegistration.js';
@@ -23,7 +24,7 @@ import { generateOpaqueToken } from '../lib/passwordAuth.js';
 import { sendTenderInvitationEmail, sendAccountCreatedEmail } from '../services/email.js';
 import { hasRfsDocumentPaid } from '../services/rfsDocumentAccessService.js';
 import { seedDefaultDocumentFields } from '../services/defaultTenderDocumentFields.js';
-import { uploadObject, getSignedDownloadUrl } from '../lib/s3.js';
+import { uploadObject, deleteObject, getSignedDownloadUrl } from '../lib/s3.js';
 import { decryptField } from '../lib/fieldEncryption.js';
 import { authRequired, optionalAuth } from '../middleware/auth.js';
 import { notifyCustodians } from '../services/custodianNotificationService.js';
@@ -51,10 +52,17 @@ const tenderDocumentUpload = multer({
 
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000; // matches organizations.ts's own TTL for this token purpose
 
-const postLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
-const readLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
-const inviteLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
-const resendLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
+// A safety cap, not real pagination — these listing routes had no limit at all before, so a
+// findAll could in principle return every tender the platform has ever created. Generous enough to
+// never affect this platform's real (B2B, low-thousands-at-most) tender volume; if it's ever
+// actually approached, that's the signal to build real cursor/offset pagination + a frontend to
+// match, not to just raise this number.
+const MAX_TENDER_LIST_ROWS = 1000;
+
+const postLimiter = rateLimit({ name: 'tenders:post', windowMs: 15 * 60 * 1000, limit: 30 });
+const readLimiter = rateLimit({ name: 'tenders:read', windowMs: 60 * 1000, limit: 30 });
+const inviteLimiter = rateLimit({ name: 'tenders:invite', windowMs: 15 * 60 * 1000, limit: 30 });
+const resendLimiter = rateLimit({ name: 'tenders:resend', windowMs: 15 * 60 * 1000, limit: 10 });
 
 // setTimeout's delay is a 32-bit signed int internally (~24.8 days is the real ceiling) — beyond
 // that Node doesn't throw, it silently clamps to firing almost immediately, which would be a real
@@ -180,19 +188,32 @@ async function autoInviteEligibleGenerators(tender: Tender): Promise<number[]> {
   const generators = await Organization.findAll({
     where: { type: 'generator', capacityMw: { [Op.gte]: tender.requiredCapacityMw } },
   });
+  if (generators.length === 0) return [];
 
-  const invited: number[] = [];
-  for (const gen of generators) {
-    const [, created] = await TenderInvitation.findOrCreate({
-      where: { tenderId: tender.id, organizationId: gen.id },
-      defaults: { tenderId: tender.id, organizationId: gen.id, status: 'invited' },
+  // Batched existing-invitation lookup + bulkCreate instead of one findOrCreate per generator inside
+  // a loop — that was a genuine N+1 (a separate DB round-trip, plus a blocking email send, per
+  // matching generator) sitting directly in the POST /tenders request path, so tender-creation
+  // latency used to scale linearly with how many generators matched. Only called once per
+  // just-created tender.id, so there's no concurrent caller this could race against.
+  const existing = await TenderInvitation.findAll({
+    where: { tenderId: tender.id, organizationId: generators.map((g) => g.id) },
+  });
+  const alreadyInvited = new Set(existing.map((inv) => inv.organizationId));
+  const toInvite = generators.filter((g) => !alreadyInvited.has(g.id));
+  if (toInvite.length === 0) return [];
+
+  await TenderInvitation.bulkCreate(toInvite.map((g) => ({ tenderId: tender.id, organizationId: g.id, status: 'invited' })));
+
+  // Fire-and-forget, same reasoning as every other notification email in this codebase (e.g.
+  // vettingAuctionBridge.ts's join-link emails) — a slow/broken email send must never delay tender
+  // creation itself, and no longer blocks the response one generator at a time.
+  for (const g of toInvite) {
+    sendTenderInvitationEmail(g.contactEmail, tender.title, frontendUrl('/generator-portal')).catch((err) => {
+      logger.error({ err, tenderId: tender.id, organizationId: g.id }, '[TENDER] auto-invite email failed — invitation still recorded');
     });
-    if (created) {
-      invited.push(gen.id);
-      await sendTenderInvitationEmail(gen.contactEmail, tender.title, frontendUrl('/generator-portal'));
-    }
   }
-  return invited;
+
+  return toInvite.map((g) => g.id);
 }
 
 // A buyer submits a request describing what they want — not a live tender. An internal admin
@@ -304,28 +325,42 @@ router.post('/tenders', postLimiter, ...authRequired('admin'), async (req, res, 
       return res.status(400).json({ success: false, error: 'buyerOrgId does not refer to a real buyer organization' });
     }
 
-    const tender = await Tender.create({
-      buyerOrgId: buyerOrg.id,
-      title: parsed.data.title,
-      requiredCapacityMw: String(parsed.data.requiredCapacityMw),
-      requirementsDetail: parsed.data.requirementsDetail ?? null,
-      rfsDocumentFeePaise: parsed.data.rfsDocumentFeePaise,
-      bidProcessingFeePaise: parsed.data.bidProcessingFeePaise,
-      emdAmountPaise: parsed.data.emdAmountPaise,
-      bidSubmissionDeadline: new Date(parsed.data.bidSubmissionDeadline),
-      technicalBidOpenAt: new Date(parsed.data.technicalBidOpenAt),
-      financialBidOpenAt: new Date(parsed.data.financialBidOpenAt),
-      useLandedRate: parsed.data.useLandedRate,
-      equityValue: parsed.data.equityValue !== undefined ? String(parsed.data.equityValue) : null,
-      totalUnitsPerYear: parsed.data.totalUnitsPerYear !== undefined ? String(parsed.data.totalUnitsPerYear) : null,
+    // Transactional: previously Tender.create, the source request's status update, and the default
+    // document-checklist seed were three separate un-transacted writes — a failure partway (e.g.
+    // seedDefaultDocumentFields throwing) left a committed Tender with no document checklist, which
+    // every downstream stage (tenderDocuments.ts, vettingBids.ts's required-documents gate) assumes
+    // exists. Ceremony scheduling and auto-invite below stay outside the transaction deliberately —
+    // they're best-effort notification side effects (timers, blocking email sends), not part of the
+    // tender's own core invariant.
+    const tender = await sequelize.transaction(async (transaction) => {
+      const tender = await Tender.create(
+        {
+          buyerOrgId: buyerOrg.id,
+          title: parsed.data.title,
+          requiredCapacityMw: String(parsed.data.requiredCapacityMw),
+          requirementsDetail: parsed.data.requirementsDetail ?? null,
+          rfsDocumentFeePaise: parsed.data.rfsDocumentFeePaise,
+          bidProcessingFeePaise: parsed.data.bidProcessingFeePaise,
+          emdAmountPaise: parsed.data.emdAmountPaise,
+          bidSubmissionDeadline: new Date(parsed.data.bidSubmissionDeadline),
+          technicalBidOpenAt: new Date(parsed.data.technicalBidOpenAt),
+          financialBidOpenAt: new Date(parsed.data.financialBidOpenAt),
+          useLandedRate: parsed.data.useLandedRate,
+          equityValue: parsed.data.equityValue !== undefined ? String(parsed.data.equityValue) : null,
+          totalUnitsPerYear: parsed.data.totalUnitsPerYear !== undefined ? String(parsed.data.totalUnitsPerYear) : null,
+        },
+        { transaction }
+      );
+
+      if (request) await request.update({ status: 'converted', tenderId: tender.id }, { transaction });
+
+      // Stage 6.3's default document checklist — the buyer can add/delete fields afterward via
+      // tenderDocuments.ts, but every tender starts from the plan's own default list rather than an
+      // empty registry.
+      await seedDefaultDocumentFields(tender.id, transaction);
+
+      return tender;
     });
-
-    if (request) await request.update({ status: 'converted', tenderId: tender.id });
-
-    // Stage 6.3's default document checklist — the buyer can add/delete fields afterward via
-    // tenderDocuments.ts, but every tender starts from the plan's own default list rather than an
-    // empty registry.
-    await seedDefaultDocumentFields(tender.id);
 
     // Custodian ceremony invites fire automatically when each scheduled date arrives — see
     // services/custodianNotificationService.ts and scheduleAt's own comment on the restart caveat.
@@ -563,7 +598,14 @@ router.post('/tenders/:id/tender-document', postLimiter, ...authRequired('admin'
 
     const s3Key = `tenders/${id}/tender-document-${Date.now()}-${req.file.originalname}`;
     await uploadObject(s3Key, req.file.buffer, 'application/pdf');
-    await tender.update({ tenderDocumentS3Key: s3Key, tenderDocumentOriginalFilename: req.file.originalname });
+    try {
+      await tender.update({ tenderDocumentS3Key: s3Key, tenderDocumentOriginalFilename: req.file.originalname });
+    } catch (err) {
+      // The upload above already succeeded — clean up rather than leave an orphaned object in S3
+      // with nothing referencing it (same reasoning as tenderDocuments.ts's upload routes).
+      await deleteObject(s3Key).catch((cleanupErr) => logger.error({ err: cleanupErr, s3Key }, '[TENDER] failed to clean up orphaned tender-document upload'));
+      throw err;
+    }
 
     logger.info({ reqId: req.requestId, tenderId: id }, '[TENDER] tender document uploaded');
     res.json({ success: true });
@@ -589,6 +631,7 @@ router.get('/tenders', readLimiter, async (req, res, next) => {
     const tenders = await Tender.findAll({
       where: statusFilter ? { status: statusFilter } : {},
       order: [['id', 'DESC']],
+      limit: MAX_TENDER_LIST_ROWS,
     });
 
     res.json({
@@ -617,7 +660,7 @@ router.get('/tenders/mine', readLimiter, ...authRequired('generator'), async (re
     const emdSubmissions = await EmdSubmission.findAll({ where: { organizationId: org.id } });
     const emdByTenderId = new Map(emdSubmissions.map((s) => [s.tenderId, s]));
 
-    const allTenders = await Tender.findAll({ order: [['id', 'DESC']] });
+    const allTenders = await Tender.findAll({ order: [['id', 'DESC']], limit: MAX_TENDER_LIST_ROWS });
 
     // RfS Document payments are keyed by payerEmail, not organizationId (see
     // rfsDocumentAccessService.ts — this purchase is deliberately account-less) — one batched lookup
@@ -670,7 +713,7 @@ router.get('/tenders/mine', readLimiter, ...authRequired('generator'), async (re
 router.get('/tenders/mine-as-buyer', readLimiter, ...authRequired('buyer'), async (req, res, next) => {
   try {
     const org = req.org!;
-    const tenders = await Tender.findAll({ where: { buyerOrgId: org.id }, order: [['id', 'DESC']] });
+    const tenders = await Tender.findAll({ where: { buyerOrgId: org.id }, order: [['id', 'DESC']], limit: MAX_TENDER_LIST_ROWS });
     const auctions = await Auction.findAll({ where: { tenderRef: tenders.map((t) => t.id) } });
     const auctionByTenderRef = new Map(auctions.map((a) => [a.tenderRef, a]));
 
@@ -714,7 +757,7 @@ router.get('/tenders/next-id', readLimiter, ...authRequired('admin'), async (req
 // it needs in one query each, not once per tender.
 router.get('/tenders/history', readLimiter, ...authRequired('admin'), async (req, res, next) => {
   try {
-    const tenders = await Tender.findAll({ order: [['id', 'DESC']] });
+    const tenders = await Tender.findAll({ order: [['id', 'DESC']], limit: MAX_TENDER_LIST_ROWS });
 
     const buyerOrgIds = [...new Set(tenders.map((t) => t.buyerOrgId))];
     const buyers = await Organization.findAll({ where: { id: buyerOrgIds } });

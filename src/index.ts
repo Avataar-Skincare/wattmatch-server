@@ -36,14 +36,19 @@ const app = express();
 const port = process.env.PORT ?? 4000;
 
 // TRUST_PROXY_HOPS: the number of reverse-proxy hops in front of this process (e.g. an ALB/
-// CloudFront in front of the app = 1). Every route's express-rate-limit instance keys on req.ip,
-// which without this reads as the proxy's own IP for every request once deployed behind one —
-// bucketing every real caller together and effectively disabling those limits. Left unset (today's
-// behavior) outside a real deployment; set explicitly once the real hop count is known — guessing
-// wrong would let a caller spoof X-Forwarded-For to dodge the limit, which is worse than leaving it
-// unset until the real count is confirmed.
+// CloudFront in front of the app = 1). Every route's rate limiter (lib/rateLimit.ts) keys on
+// req.ip, which without this reads as the proxy's own IP for every request once deployed behind
+// one — bucketing every real caller together and effectively disabling those limits. Left unset
+// (today's behavior) outside a real deployment; set explicitly once the real hop count is known —
+// guessing wrong would let a caller spoof X-Forwarded-For to dodge the limit, which is worse than
+// leaving it unset until the real count is confirmed.
 const trustProxyHops = process.env.TRUST_PROXY_HOPS ? Number(process.env.TRUST_PROXY_HOPS) : undefined;
 if (trustProxyHops !== undefined) app.set('trust proxy', trustProxyHops);
+else if (process.env.NODE_ENV === 'production') {
+  // A missing value is silent and easy to miss until someone notices rate limits aren't actually
+  // limiting anything — this makes the gap visible at boot instead of only during an incident.
+  logger.warn('TRUST_PROXY_HOPS is not set in production — every IP-keyed rate limiter will bucket all callers behind the same reverse proxy together.');
+}
 
 app.use(helmet());
 app.use(cors({ origin: process.env.CORS_ORIGIN ?? 'http://localhost:5173' }));
@@ -91,7 +96,34 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
+// Previously returned { ok: true } unconditionally, with no check of MySQL, the restricted audit
+// connection, or Redis — a load balancer/uptime monitor could see "healthy" while every DB-backed
+// route was actually failing (especially combined with start()'s own connection failures below
+// being logged rather than fatal). Each dependency gets its own short-timeout check so one hung
+// connection can't make this route hang too; the response is 200 only if every dependency answers.
+const HEALTH_CHECK_TIMEOUT_MS = 2000;
+
+async function checkHealthy(check: () => Promise<unknown>): Promise<boolean> {
+  try {
+    await Promise.race([
+      check(),
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error('timed out')), HEALTH_CHECK_TIMEOUT_MS)),
+    ]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+app.get('/api/health', async (_req, res) => {
+  const [mysql, auditMysql, redisOk] = await Promise.all([
+    checkHealthy(() => sequelize.authenticate()),
+    checkHealthy(() => auditSequelize.authenticate()),
+    checkHealthy(() => redis.ping()),
+  ]);
+  const ok = mysql && auditMysql && redisOk;
+  res.status(ok ? 200 : 503).json({ ok, dependencies: { mysql, auditMysql, redis: redisOk } });
+});
 app.use('/api/leads', leadsRouter);
 app.use('/api/contact', contactRouter);
 app.use('/api/admin', adminRouter);
@@ -135,7 +167,11 @@ app.use('/api', devLocalStorageRouter);
 
 app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
   logger.error({ err, reqId: req.requestId, method: req.method, url: req.originalUrl }, 'unhandled error');
-  res.status(500).json({ error: 'Internal server error', requestId: req.requestId });
+  // { success: false, error } — matching the shape every route in this codebase already uses for
+  // its own handled errors (via handleCreateError.ts or an inline res.status(...).json(...)). This
+  // used to be a different shape ({ error, requestId }) with no `success` key at all, so a client
+  // that checks `body.success === false` to detect failure wouldn't recognize an unhandled 500.
+  res.status(500).json({ success: false, error: 'Internal server error', requestId: req.requestId });
 });
 
 async function start() {

@@ -52,5 +52,8 @@ AuctionParticipant.init(
     sequelize,
     tableName: 'wattmatch_auction_participants',
     underscored: true,
+    // organization_id is what routes/auctions.ts's /join endpoint looks up on every request — left
+    // unindexed since the column was added, which meant that lookup was a full table scan.
+    indexes: [{ fields: ['organization_id'] }],
   }
 );

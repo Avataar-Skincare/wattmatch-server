@@ -1,4 +1,4 @@
-import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -21,10 +21,25 @@ function bucketName(): string | undefined {
   return process.env.AWS_S3_BUCKET;
 }
 
+// Every local-storage key this app generates itself is a fixed, safe shape (e.g.
+// `tenders/${id}/...`) — but devLocalStorage.ts's GET route passes a caller-supplied wildcard path
+// segment straight through to readObject as `key`, with no `..`-traversal check anywhere before
+// this point. That route is only ever reachable while AWS_S3_BUCKET is unset (local dev/test) — but
+// relying solely on that gate means a real deployment that simply forgets to set the bucket
+// silently turns this into an unauthenticated path-traversal file read. Resolving and checking the
+// prefix here protects every caller of every function below, not just that one route.
+function resolveLocalStoragePath(key: string): string | null {
+  const root = path.resolve(LOCAL_STORAGE_DIR);
+  const resolved = path.resolve(root, key);
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) return null;
+  return resolved;
+}
+
 export async function uploadObject(key: string, body: Buffer, contentType: string): Promise<void> {
   const bucket = bucketName();
   if (!bucket) {
-    const filePath = path.join(LOCAL_STORAGE_DIR, key);
+    const filePath = resolveLocalStoragePath(key);
+    if (!filePath) throw new Error(`Refusing to write outside local storage root: ${key}`);
     await fs.mkdir(path.dirname(filePath), { recursive: true });
     await fs.writeFile(filePath, body);
     logger.info({ key, filePath }, '[S3] AWS_S3_BUCKET not set — wrote to local storage fallback');
@@ -44,11 +59,29 @@ export async function uploadObject(key: string, body: Buffer, contentType: strin
   );
 }
 
+// Best-effort cleanup for the "uploaded successfully, then the DB write that was supposed to
+// reference it failed" case (see tenderDocuments.ts's own comment on why upload must happen before
+// the DB row can be written) — an orphaned object left behind is harmless but wasteful; failing to
+// delete it is not worth failing the request over a second time, so callers should log and move on
+// rather than let this throw replace the original error.
+export async function deleteObject(key: string): Promise<void> {
+  const bucket = bucketName();
+  if (!bucket) {
+    const filePath = resolveLocalStoragePath(key);
+    if (!filePath) return;
+    await fs.unlink(filePath).catch(() => {});
+    return;
+  }
+  await getClient().send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
+}
+
 export async function readObject(key: string): Promise<Buffer | null> {
   const bucket = bucketName();
   if (!bucket) {
+    const filePath = resolveLocalStoragePath(key);
+    if (!filePath) return null;
     try {
-      return await fs.readFile(path.join(LOCAL_STORAGE_DIR, key));
+      return await fs.readFile(filePath);
     } catch {
       return null;
     }

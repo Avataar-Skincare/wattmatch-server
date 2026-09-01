@@ -34,6 +34,7 @@ export interface RefundInput {
 export interface RefundResult {
   refundId: string;
   status: string;
+  amountPaise: number;
 }
 
 let client: Razorpay | null = null;
@@ -44,14 +45,44 @@ async function getClient(): Promise<Razorpay> {
   return client;
 }
 
+// The Razorpay SDK builds its own internal axios instance (see node_modules/razorpay/dist/api.js)
+// with no timeout configured anywhere its public constructor exposes — a stalled connection to
+// Razorpay would otherwise hang whatever depends on it (checkout, admin refund, the reconciliation
+// loop) indefinitely. Racing against a plain timer here doesn't cancel the underlying HTTP request,
+// but it does guarantee this adapter's own promise settles, so every caller gets a timely error
+// instead of hanging forever.
+const RAZORPAY_REQUEST_TIMEOUT_MS = 15_000;
+
+function withTimeout<T>(promise: Promise<T>, operation: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`Razorpay ${operation} timed out after ${RAZORPAY_REQUEST_TIMEOUT_MS}ms`)),
+      RAZORPAY_REQUEST_TIMEOUT_MS
+    );
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
 export async function createOrder(input: CreateOrderInput): Promise<CreateOrderResult> {
   const rzp = await getClient();
-  const order = await rzp.orders.create({
-    amount: input.amountPaise,
-    currency: input.currency,
-    receipt: input.receipt,
-    notes: input.notes,
-  });
+  const order = await withTimeout(
+    rzp.orders.create({
+      amount: input.amountPaise,
+      currency: input.currency,
+      receipt: input.receipt,
+      notes: input.notes,
+    }),
+    'order creation'
+  );
   return { orderId: order.id, amountPaise: Number(order.amount), currency: order.currency };
 }
 
@@ -96,12 +127,15 @@ export interface OrderPaymentAttempt {
 // not something to force awkwardly into one of the other four.
 export async function fetchOrderPayments(orderId: string): Promise<OrderPaymentAttempt[]> {
   const rzp = await getClient();
-  const result = await rzp.orders.fetchPayments(orderId);
+  const result = await withTimeout(rzp.orders.fetchPayments(orderId), 'fetch order payments');
   return result.items.map((item) => ({ paymentId: item.id, status: item.status }));
 }
 
 export async function refund(input: RefundInput): Promise<RefundResult> {
   const rzp = await getClient();
-  const result = await rzp.payments.refund(input.paymentId, input.amountPaise ? { amount: input.amountPaise } : {});
-  return { refundId: result.id, status: result.status ?? 'processed' };
+  const result = await withTimeout(
+    rzp.payments.refund(input.paymentId, input.amountPaise ? { amount: input.amountPaise } : {}),
+    'refund'
+  );
+  return { refundId: result.id, status: result.status ?? 'processed', amountPaise: Number(result.amount) };
 }

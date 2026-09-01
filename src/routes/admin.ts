@@ -21,9 +21,17 @@ function parseLimit(req: import('express').Request): number {
   return Math.min(raw, MAX_LIMIT);
 }
 
+// Previously nothing capped how far back these lists could be paged — only the page SIZE was
+// bounded (parseLimit above), so there was no way to ever see past the first MAX_LIMIT rows.
+function parseOffset(req: import('express').Request): number {
+  const raw = Number(req.query.offset);
+  if (!Number.isFinite(raw) || raw < 0) return 0;
+  return Math.floor(raw);
+}
+
 router.get('/leads/ci', async (req, res, next) => {
   try {
-    const rows = await CILead.findAll({ order: [['id', 'DESC']], limit: parseLimit(req) });
+    const rows = await CILead.findAll({ order: [['id', 'DESC']], limit: parseLimit(req), offset: parseOffset(req) });
     res.json(rows);
   } catch (err) {
     next(err);
@@ -32,7 +40,7 @@ router.get('/leads/ci', async (req, res, next) => {
 
 router.get('/leads/generator', async (req, res, next) => {
   try {
-    const rows = await GeneratorLead.findAll({ order: [['id', 'DESC']], limit: parseLimit(req) });
+    const rows = await GeneratorLead.findAll({ order: [['id', 'DESC']], limit: parseLimit(req), offset: parseOffset(req) });
     res.json(rows);
   } catch (err) {
     next(err);
@@ -41,7 +49,7 @@ router.get('/leads/generator', async (req, res, next) => {
 
 router.get('/contact', async (req, res, next) => {
   try {
-    const rows = await ContactMessage.findAll({ order: [['id', 'DESC']], limit: parseLimit(req) });
+    const rows = await ContactMessage.findAll({ order: [['id', 'DESC']], limit: parseLimit(req), offset: parseOffset(req) });
     res.json(rows);
   } catch (err) {
     next(err);
@@ -54,7 +62,7 @@ router.get('/contact', async (req, res, next) => {
 // with, instead of every caller re-deriving this same email join itself.
 router.get('/registrations/ci', async (req, res, next) => {
   try {
-    const rows = await CIRegistration.findAll({ order: [['id', 'DESC']], limit: parseLimit(req) });
+    const rows = await CIRegistration.findAll({ order: [['id', 'DESC']], limit: parseLimit(req), offset: parseOffset(req) });
     const orgs = await Organization.findAll({ where: { contactEmail: [...new Set(rows.map((r) => r.email))] } });
     const orgIdByEmail = new Map(orgs.map((o) => [o.contactEmail, o.id]));
     res.json(rows.map((r) => ({ ...r.toJSON(), buyerOrgId: orgIdByEmail.get(r.email) ?? null })));
@@ -65,7 +73,7 @@ router.get('/registrations/ci', async (req, res, next) => {
 
 router.get('/registrations/generator', async (req, res, next) => {
   try {
-    const rows = await GeneratorRegistration.findAll({ order: [['id', 'DESC']], limit: parseLimit(req) });
+    const rows = await GeneratorRegistration.findAll({ order: [['id', 'DESC']], limit: parseLimit(req), offset: parseOffset(req) });
     res.json(rows);
   } catch (err) {
     next(err);

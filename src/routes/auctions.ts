@@ -22,13 +22,12 @@ const router = Router();
 // after a longer gap just re-runs this same route from a still-or-newly-logged-in org session.
 const JOIN_TOKEN_TTL = '4h';
 
-const joinLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false });
-const mineLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
+const joinLimiter = rateLimit({ name: 'auctions:join', windowMs: 15 * 60 * 1000, limit: 20 });
+const mineLimiter = rateLimit({ name: 'auctions:mine', windowMs: 60 * 1000, limit: 30 });
 const identityRevealLimiter = rateLimit({
+  name: 'auctions:identityReveal',
   windowMs: 60 * 1000,
   limit: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
   message: { success: false, error: 'Too many identity-reveal requests from this IP — try again shortly.' },
 });
 

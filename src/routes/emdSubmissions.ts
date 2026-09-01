@@ -34,9 +34,9 @@ const upload = multer({
   },
 });
 
-const readLimiter = rateLimit({ windowMs: 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false });
-const writeLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
-const resolveLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
+const readLimiter = rateLimit({ name: 'emdSubmissions:read', windowMs: 60 * 1000, limit: 60 });
+const writeLimiter = rateLimit({ name: 'emdSubmissions:write', windowMs: 15 * 60 * 1000, limit: 30 });
+const resolveLimiter = rateLimit({ name: 'emdSubmissions:resolve', windowMs: 60 * 1000, limit: 30 });
 
 const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 

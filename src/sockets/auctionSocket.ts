@@ -82,11 +82,21 @@ export function setupAuctionSocket(httpServer: HTTPServer) {
       'rules:accepted': () => void;
       'state:update': (payload: { currentBid: number; windowEndsAt: number; alias: string }) => void;
       'bid:rejected': (payload: { reason: string; currentBid?: number }) => void;
+      'session:error': (payload: { message: string }) => void;
       'auction:closed': (payload: {
         winnerAlias: string | null;
         winningBid: number;
         resultType: string;
         disclosure: string;
+        // Added so a client that never received a live state:sync for this auction (a late joiner
+        // arriving after the closed-state Redis key's 24h TTL has expired — see the connect handler
+        // below) can still render an accurate closed-state summary instead of guessing/defaulting
+        // these to 0/false. All four are otherwise-constant-or-final-at-close values, persisted on
+        // the Auction row itself (see Auction.ts), so they're always available even once Redis is gone.
+        useLandedRate: boolean;
+        extensionCount: number;
+        maxExtensions: number;
+        minUndercut: number;
       }) => void;
       'session:replaced': () => void;
     },
@@ -217,10 +227,44 @@ export function setupAuctionSocket(httpServer: HTTPServer) {
           winningBid: state.currentBid,
           resultType: RESULT_TYPE,
           disclosure: RESULT_DISCLOSURE,
+          useLandedRate: state.useLandedRate,
+          extensionCount: state.extensionCount,
+          maxExtensions: state.maxExtensions,
+          minUndercut: state.minUndercut,
         });
+      } else if (!state) {
+        // Redis had nothing at all — either this auction's key never existed on this instance, or
+        // (now that markAuctionClosed sets a 24h TTL — see its own comment) it simply expired after
+        // sitting closed for a day. Fall back to the DB's own mirrored fields (updated on every
+        // accepted bid and once more at close, see the close-tick handler below) rather than leaving
+        // a late joiner looking at a blank page with no way to ever see the result again.
+        const auction = await Auction.findByPk(auctionId);
+        if (auction?.status === 'closed') {
+          // currentLowestBid stays null in the DB only if literally no bid was ever accepted — Redis
+          // never has this gap (initAuctionState seeds currentBid with openingBid from the start), so
+          // this falls back the same way to keep the two paths' output identical. useLandedRate/
+          // maxAutoExtensions/minUndercut are constant for the auction's lifetime and were always on
+          // this row; currentExtensionCount is the close-tick handler's own mirror of Redis's final
+          // count (see below) — none of these are lost just because the Redis key expired.
+          socket.emit('auction:closed', {
+            winnerAlias: auction.currentLeaderAlias,
+            winningBid: Number(auction.currentLowestBid ?? auction.openingBid),
+            resultType: RESULT_TYPE,
+            disclosure: RESULT_DISCLOSURE,
+            useLandedRate: auction.useLandedRate,
+            extensionCount: auction.currentExtensionCount,
+            maxExtensions: auction.maxAutoExtensions,
+            minUndercut: Number(auction.minUndercut),
+          });
+        }
       }
     } catch (err) {
       logger.error({ socketId: socket.id, auctionId, participantId, err }, '[AUCTION_SESSION] failed to complete connection setup');
+      // Without this, a Redis blip here leaves the socket connected with no state:sync/you:info
+      // ever sent and no indication anything went wrong — the client just hangs looking like it's
+      // still waiting for data that will never arrive. An explicit error event at least lets the
+      // frontend show something actionable (e.g. "reconnecting…") instead of silence.
+      socket.emit('session:error', { message: 'Failed to load auction state — please refresh.' });
       return;
     }
 
@@ -332,26 +376,13 @@ export function setupAuctionSocket(httpServer: HTTPServer) {
 
         const result = await submitBid(auctionId, rate, returnPercent, participantId, alias);
 
-        await appendAuditedBid({
-          auctionId,
-          participantId,
-          alias,
-          amount: String(result.landedRate),
-          rate: String(rate),
-          returnPercent: String(returnPercent),
-          accepted: result.accepted,
-          rejectReason: result.accepted ? null : result.reason,
-          ipHash,
-        });
-
+        // Once Redis's compare-and-swap has decided the outcome, that decision is final from every
+        // client's point of view — sent here, before anything that can still fail below. A later
+        // failure while writing the audit log or the MySQL mirror must never flip an already-accepted
+        // bid into a reported rejection: the bidder really did become the new leader, and telling them
+        // otherwise while the room broadcast (or lack of one) still reflects that would leave Redis,
+        // MySQL, and the client all disagreeing with each other instead of just Redis and MySQL.
         if (result.accepted) {
-          // currentLeaderParticipantId/currentLeaderAlias mirror Redis purely for restart
-          // resilience (see reconstructAuctionState) — Redis stays the source of truth for bid
-          // acceptance itself, this is never read on the normal live path.
-          await Auction.update(
-            { currentLowestBid: String(result.currentBid), currentLeaderParticipantId: participantId, currentLeaderAlias: alias },
-            { where: { id: auctionId } }
-          );
           io.to(room).emit('state:update', {
             currentBid: result.currentBid,
             windowEndsAt: result.windowEndsAt,
@@ -359,6 +390,40 @@ export function setupAuctionSocket(httpServer: HTTPServer) {
           });
         } else {
           socket.emit('bid:rejected', { reason: result.reason, currentBid: result.currentBid });
+        }
+
+        try {
+          await appendAuditedBid({
+            auctionId,
+            participantId,
+            alias,
+            amount: String(result.landedRate),
+            rate: String(rate),
+            returnPercent: String(returnPercent),
+            accepted: result.accepted,
+            rejectReason: result.accepted ? null : result.reason,
+            ipHash,
+          });
+
+          if (result.accepted) {
+            // currentLeaderParticipantId/currentLeaderAlias mirror Redis purely for restart
+            // resilience (see reconstructAuctionState) — Redis stays the source of truth for bid
+            // acceptance itself, this is never read on the normal live path.
+            await Auction.update(
+              { currentLowestBid: String(result.currentBid), currentLeaderParticipantId: participantId, currentLeaderAlias: alias },
+              { where: { id: auctionId } }
+            );
+          }
+        } catch (err) {
+          // The client has already been told the true (Redis) outcome above — this only means the
+          // audit log or the MySQL mirror is now behind Redis, not that the bid itself failed. The
+          // close-tick reads Redis's own state (not these mirror columns) to build the result
+          // summary, so this gap is harmless as long as Redis's TTL hasn't expired by the time
+          // anything falls back to reading the mirror (see markAuctionClosed's own comment).
+          logger.error(
+            { socketId: socket.id, auctionId, participantId, accepted: result.accepted, err },
+            '[AUCTION_BID] audit-log/DB-mirror write failed after the bid outcome was already sent to clients'
+          );
         }
       } catch (err) {
         logger.error({ socketId: socket.id, auctionId, participantId, err }, '[AUCTION_BID] unexpected error');
@@ -423,12 +488,26 @@ function startCloseCheckLoop(io: SocketIOServer) {
 
           await markAuctionClosed(auction.id);
           await Auction.update(
-            // currentExtensionCount was otherwise never written anywhere — every closed auction's
-            // DB row permanently showed 0 extensions used regardless of what actually happened,
-            // since only Redis tracked the real count during the live phase. Mirroring it here
-            // means the historical record (and buildAndStoreResultSummary below, which reads this
-            // same row) reflects reality instead of a stale default.
-            { status: 'closed', winnerParticipantId: state.leaderParticipantId, currentExtensionCount: state.extensionCount },
+            {
+              status: 'closed',
+              winnerParticipantId: state.leaderParticipantId,
+              // currentExtensionCount was otherwise never written anywhere — every closed auction's
+              // DB row permanently showed 0 extensions used regardless of what actually happened,
+              // since only Redis tracked the real count during the live phase. Mirroring it here
+              // means the historical record (and buildAndStoreResultSummary below, which reads this
+              // same row) reflects reality instead of a stale default.
+              currentExtensionCount: state.extensionCount,
+              // Re-derived from this same Redis `state` read above, not left as whatever the last
+              // per-bid mirror write (bid:new's handler, above) happened to leave behind — those are
+              // independent async writes with no ordering guarantee across concurrent accepted bids,
+              // so the last one to land isn't necessarily the true final price/leader. Redis's own
+              // state always is. This matters now that markAuctionClosed's 24h TTL lets this same
+              // Redis key expire — once it does, a late joiner falls back to exactly these two
+              // columns (see the connect handler above), so they need to be correct at close, not
+              // just "whatever survived the last race."
+              currentLowestBid: String(state.currentBid),
+              currentLeaderAlias: state.leaderAlias,
+            },
             { where: { id: auction.id } }
           );
           await buildAndStoreResultSummary(auction.id, state.leaderParticipantId, state.leaderAlias, state.currentBid);
@@ -441,6 +520,10 @@ function startCloseCheckLoop(io: SocketIOServer) {
             winningBid: state.currentBid,
             resultType: RESULT_TYPE,
             disclosure: RESULT_DISCLOSURE,
+            useLandedRate: state.useLandedRate,
+            extensionCount: state.extensionCount,
+            maxExtensions: state.maxExtensions,
+            minUndercut: state.minUndercut,
           });
           // No explicit lock cleanup needed at close anymore — the DB-level advisory lock in
           // auctionEngine.ts is acquired and released within each individual write, not held
@@ -456,6 +539,37 @@ function startCloseCheckLoop(io: SocketIOServer) {
           );
         } catch (err) {
           logger.error({ auctionId: auction.id, err }, '[AUCTION_CLOSE] failed to close');
+        }
+      }
+
+      // Retry pass: an auction that flipped to 'closed' above (this tick or an earlier one) but
+      // whose result-summary build then threw would otherwise never be retried — the query above
+      // only ever looks at 'live' rows, so once status flips, a failure past that point used to be
+      // permanent (resultSummaryJson stays null forever, breaking that auction's export/evidence
+      // route). Safe to redo: buildAndStoreResultSummary only recomputes and overwrites, and the
+      // 'auction:closed' broadcast is never reached before it in the try block above, so a previous
+      // failed attempt never got as far as broadcasting.
+      const unsummarized = await Auction.findAll({ where: { status: 'closed', resultSummaryJson: null } });
+      for (const auction of unsummarized) {
+        try {
+          const state = await getAuctionState(auction.id);
+          const leaderAlias = state?.leaderAlias ?? auction.currentLeaderAlias;
+          const leaderParticipantId = state?.leaderParticipantId ?? auction.winnerParticipantId;
+          const winningBid = state ? state.currentBid : Number(auction.currentLowestBid ?? auction.openingBid);
+          await buildAndStoreResultSummary(auction.id, leaderParticipantId, leaderAlias, winningBid);
+          io.to(`auction:${auction.id}`).emit('auction:closed', {
+            winnerAlias: leaderAlias,
+            winningBid,
+            resultType: RESULT_TYPE,
+            disclosure: RESULT_DISCLOSURE,
+            useLandedRate: state?.useLandedRate ?? auction.useLandedRate,
+            extensionCount: state?.extensionCount ?? auction.currentExtensionCount,
+            maxExtensions: state?.maxExtensions ?? auction.maxAutoExtensions,
+            minUndercut: state?.minUndercut ?? Number(auction.minUndercut),
+          });
+          logger.info({ auctionId: auction.id }, '[AUCTION_CLOSE] result summary retried and stored');
+        } catch (err) {
+          logger.error({ auctionId: auction.id, err }, '[AUCTION_CLOSE] retry of result-summary build failed');
         }
       }
     } catch (err) {

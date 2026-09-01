@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { jsonRateLimit as rateLimit } from '../lib/rateLimit.js';
 import crypto from 'node:crypto';
 import { Op } from 'sequelize';
+import { sequelize } from '../db/sequelize.js';
 import { z } from 'zod';
 import { Tender } from '../models/Tender.js';
 import { VettingBid } from '../models/VettingBid.js';
@@ -71,9 +72,9 @@ export function escrowKey(tenderId: number, envelope: VettingEnvelope): string {
 
 // Ceremonies are rare, human-paced actions — these bound scripted abuse, not legitimate use. Set
 // well above what even a custodian re-checking status a few times in a row would ever hit.
-const readLimiter = rateLimit({ windowMs: 60 * 1000, limit: 100, standardHeaders: true, legacyHeaders: false });
-const shareLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
-const completeLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
+const readLimiter = rateLimit({ name: 'vettingCustodian:read', windowMs: 60 * 1000, limit: 100 });
+const shareLimiter = rateLimit({ name: 'vettingCustodian:share', windowMs: 60 * 1000, limit: 30 });
+const completeLimiter = rateLimit({ name: 'vettingCustodian:complete', windowMs: 60 * 1000, limit: 30 });
 
 router.get('/vetting-custodian/ceremony', readLimiter, requireCustodianAuth, async (req, res, next) => {
   try {
@@ -253,30 +254,46 @@ router.post('/vetting-custodian/ceremony/complete', completeLimiter, requireCust
       return res.status(409).json({ success: false, error: 'The opened bid set does not match what is actually pending for this tender/envelope' });
     }
 
+    // Encrypt every opened envelope's content outside the transaction — these are KMS calls, not DB
+    // writes, and there's no reason to hold a transaction open across however many of them there are.
     const decidedAt = new Date();
-    for (const { bidId, content } of parsed.data.opened) {
-      const encrypted = await encryptField(content);
-      await VettingBid.update(
-        envelope === 'technical' ? { technicalOpenedContent: encrypted } : { financialOpenedContent: encrypted },
-        { where: { id: bidId } }
-      );
-      // Financial has no separate admin-decision step the way technical does (technical-decision in
-      // vettingBids.ts) — a financial envelope, once opened, IS the settled figure. Writing
-      // VettingDecidedRecord here (not just the staging column above) matches exactly what the old
-      // server-side open-financial did, and vettingAuctionBridge.ts's promote-to-auction reads this
-      // table directly to seed the auction's opening bid — this preserves that dependency unchanged.
-      if (envelope === 'financial') {
-        await VettingDecidedRecord.create({ vettingBidId: bidId, envelope: 'financial', encryptedContent: encrypted, decidedAt });
-      }
-    }
+    const encryptedByBidId = new Map(
+      await Promise.all(parsed.data.opened.map(async ({ bidId, content }) => [bidId, await encryptField(content)] as const))
+    );
 
-    await VettingOpeningAttestation.create({
-      tenderRef: String(tenderId),
-      envelope,
-      openedSetHash: hashOpenedSet([...claimedIds]),
-      shareFingerprint1: parsed.data.shareFingerprints[0],
-      shareFingerprint2: parsed.data.shareFingerprints[1],
-      isEmergency: false,
+    // Transactional: previously each bid's VettingBid.update + VettingDecidedRecord.create (for
+    // financial) ran as separate un-transacted writes across the whole loop, with the attestation
+    // create after it — a failure partway left some bids with their *OpenedContent set and others
+    // not, with no attestation row recorded at all. That's an inconsistent, hard-to-recover ceremony
+    // state despite this route's own framing of the opened-set check as an independent guarantee.
+    await sequelize.transaction(async (transaction) => {
+      for (const { bidId } of parsed.data.opened) {
+        const encrypted = encryptedByBidId.get(bidId)!;
+        await VettingBid.update(
+          envelope === 'technical' ? { technicalOpenedContent: encrypted } : { financialOpenedContent: encrypted },
+          { where: { id: bidId }, transaction }
+        );
+        // Financial has no separate admin-decision step the way technical does (technical-decision in
+        // vettingBids.ts) — a financial envelope, once opened, IS the settled figure. Writing
+        // VettingDecidedRecord here (not just the staging column above) matches exactly what the old
+        // server-side open-financial did, and vettingAuctionBridge.ts's promote-to-auction reads this
+        // table directly to seed the auction's opening bid — this preserves that dependency unchanged.
+        if (envelope === 'financial') {
+          await VettingDecidedRecord.create({ vettingBidId: bidId, envelope: 'financial', encryptedContent: encrypted, decidedAt }, { transaction });
+        }
+      }
+
+      await VettingOpeningAttestation.create(
+        {
+          tenderRef: String(tenderId),
+          envelope,
+          openedSetHash: hashOpenedSet([...claimedIds]),
+          shareFingerprint1: parsed.data.shareFingerprints[0],
+          shareFingerprint2: parsed.data.shareFingerprints[1],
+          isEmergency: false,
+        },
+        { transaction }
+      );
     });
 
     // Only deleted here, now that completion has actually succeeded — see /ceremony/share's own

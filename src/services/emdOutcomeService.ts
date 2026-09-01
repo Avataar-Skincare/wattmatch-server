@@ -23,12 +23,17 @@ export async function releaseEmd(
   if (!submission) return { ok: false, reason: 'not_found' };
   if (submission.status !== 'submitted') return { ok: false, reason: 'already_resolved' };
 
-  await submission.update({
-    status: 'released',
-    resolvedAt: new Date(),
-    resolvedReason: reason,
-    dispatchReference: dispatchReference ?? null,
-  });
+  // Atomic and conditional on status still being 'submitted' — not a plain instance.update(), which
+  // issues an unconditional `WHERE id = :id` and would let two concurrent admin actions on the same
+  // submission (e.g. one release and one invoke fired close together) both pass the findOne check
+  // above off the same in-memory status, then both apply, corrupting the single-resolution
+  // invariant this module's own comments describe. affectedCount === 0 means someone else's update
+  // already landed first.
+  const [affectedCount] = await EmdSubmission.update(
+    { status: 'released', resolvedAt: new Date(), resolvedReason: reason, dispatchReference: dispatchReference ?? null },
+    { where: { id: submission.id, status: 'submitted' } }
+  );
+  if (affectedCount === 0) return { ok: false, reason: 'already_resolved' };
   logger.info({ tenderId, organizationId, reason }, '[EMD] released');
   return { ok: true };
 }
@@ -39,7 +44,12 @@ export async function invokeEmd(tenderId: number, organizationId: number, reason
   if (!submission) return { ok: false, reason: 'not_found' };
   if (submission.status !== 'submitted') return { ok: false, reason: 'already_resolved' };
 
-  await submission.update({ status: 'invoked', resolvedAt: new Date(), resolvedReason: reason });
+  // Same atomic, conditional-update reasoning as releaseEmd above.
+  const [affectedCount] = await EmdSubmission.update(
+    { status: 'invoked', resolvedAt: new Date(), resolvedReason: reason },
+    { where: { id: submission.id, status: 'submitted' } }
+  );
+  if (affectedCount === 0) return { ok: false, reason: 'already_resolved' };
   logger.info({ tenderId, organizationId, reason }, '[EMD] invoked');
   return { ok: true };
 }

@@ -6,7 +6,7 @@ import { Payment, type PaymentPurpose } from '../models/Payment.js';
 import { Tender } from '../models/Tender.js';
 import { computeAmountPaise } from '../services/pricingService.js';
 import { createOrder, verifyCallback, verifyWebhookSignature } from '../lib/razorpayAdapter.js';
-import { processPaymentCaptured, processPaymentFailed, processRefundProcessed } from '../services/paymentWebhookService.js';
+import { processPaymentCaptured, processPaymentFailed, processRefundProcessed, processRefundFailed } from '../services/paymentWebhookService.js';
 import { transitionPayment } from '../services/paymentStateMachine.js';
 import { reconcileStalePayments } from '../services/paymentReconciliationService.js';
 import { refundPayment } from '../services/paymentRefundService.js';
@@ -15,11 +15,12 @@ import { Invoice } from '../models/Invoice.js';
 import { getSignedDownloadUrl } from '../lib/s3.js';
 import { authRequired, optionalAuth } from '../middleware/auth.js';
 import { logger } from '../lib/logger.js';
+import { withLock, LockContentionError } from '../lib/distributedLock.js';
 
 const router = Router();
 
 const MAX_STRING_FIELD_LENGTH = 255;
-const orderLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
+const orderLimiter = rateLimit({ name: 'payments:order', windowMs: 15 * 60 * 1000, limit: 30 });
 
 // Both schemas explicitly do NOT declare an `amount`/`amountPaise` field — Zod's default (strict
 // object shape via .strict() below) means a body that includes one is rejected outright, rather
@@ -58,7 +59,17 @@ const verifyBodySchema = z
   })
   .strict();
 
-const verifyLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
+const verifyLimiter = rateLimit({ name: 'payments:verify', windowMs: 15 * 60 * 1000, limit: 30 });
+
+// Covers the dedup check + Razorpay order creation + local DB write below as one critical section
+// — see createPaymentOrder's own comment for why order creation and the DB write can't be one DB
+// transaction (there's nothing to write until Razorpay has returned an order id). Without this lock,
+// two concurrent requests for the same tender+purpose+payer (a double-click, a retried fetch, two
+// open tabs) can both pass the "no existing order" check before either row exists, producing two
+// separate Razorpay orders for the same fee — and a real double charge if both get paid. TTL is
+// generously above razorpayAdapter's own 15s request timeout so a slow-but-successful Razorpay call
+// is never pre-empted by its own lock expiring.
+const PAYMENT_ORDER_LOCK_TTL_MS = 20_000;
 
 async function createPaymentOrder(input: {
   purpose: PaymentPurpose;
@@ -131,40 +142,58 @@ router.post('/payment/orders/rfs-document', orderLimiter, async (req, res, next)
     const tender = await Tender.findByPk(tenderId);
     if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
 
-    // De-dup guard: without this, the same person (or a retried/double-clicked frontend request)
-    // could be charged twice for the same tender's document. Not in a terminal 'failed' state means
-    // 'created'/'attempted'/'paid' — a failed attempt doesn't block a genuine retry.
-    const existing = await Payment.findOne({
-      where: { tenderId, payerEmail, purpose: 'rfs_document', status: { [Op.ne]: 'failed' } },
-      order: [['id', 'DESC']],
-    });
-    if (existing) {
-      if (existing.status === 'paid') {
+    const lockKey = `payment-order-lock:rfs_document:${tenderId}:${payerEmail}`;
+    try {
+      const result = await withLock(lockKey, PAYMENT_ORDER_LOCK_TTL_MS, async () => {
+        // De-dup guard: without this, the same person (or a retried/double-clicked frontend
+        // request) could be charged twice for the same tender's document. Not in a terminal
+        // 'failed' state means 'created'/'attempted'/'paid' — a failed attempt doesn't block a
+        // genuine retry. Run inside the lock above so a second concurrent request can't read
+        // "nothing exists yet" before the first one's Payment.create has landed.
+        const existing = await Payment.findOne({
+          where: { tenderId, payerEmail, purpose: 'rfs_document', status: { [Op.ne]: 'failed' } },
+          order: [['id', 'DESC']],
+        });
+        if (existing) {
+          if (existing.status === 'paid') {
+            return { alreadyPaid: true as const };
+          }
+          // Still in progress ('created'/'attempted') — resume that same order rather than
+          // spawning a second one; the frontend's checkout flow behaves identically either way.
+          const { keyId } = await getRazorpayConfig();
+          return { alreadyPaid: false as const, orderId: existing.razorpayOrderId, amount: existing.amountPaise, currency: existing.currency, keyId };
+        }
+
+        // organizationId is always null for this purpose — RfS Document access is gated by
+        // payerEmail (see rfsDocumentAccessService.ts), not by linking the payment to an
+        // organization record.
+        const created = await createPaymentOrder({
+          purpose: 'rfs_document',
+          tenderId,
+          organizationId: null,
+          payerName: parsed.data.payerName,
+          payerEmail,
+          payerCompany: parsed.data.company,
+          payerDesignation: parsed.data.designation,
+          payerMobile: parsed.data.mobile,
+          payerIsGenerator: parsed.data.isGenerator,
+          consentGivenAt: new Date(),
+          notes: parsed.data.notes ?? null,
+        });
+        return { alreadyPaid: false as const, ...created };
+      });
+
+      if (result.alreadyPaid) {
         return res.status(409).json({ success: false, error: "You've already purchased this tender's RfS Document" });
       }
-      // Still in progress ('created'/'attempted') — resume that same order rather than spawning a
-      // second one; the frontend's checkout flow behaves identically either way.
-      const { keyId } = await getRazorpayConfig();
-      return res.json({ success: true, orderId: existing.razorpayOrderId, amount: existing.amountPaise, currency: existing.currency, keyId });
+      const { alreadyPaid: _alreadyPaid, ...rest } = result;
+      res.json({ success: true, ...rest });
+    } catch (err) {
+      if (err instanceof LockContentionError) {
+        return res.status(409).json({ success: false, error: 'A payment request for this document is already being processed — please wait a moment and try again.' });
+      }
+      throw err;
     }
-
-    // organizationId is always null for this purpose — RfS Document access is gated by payerEmail
-    // (see rfsDocumentAccessService.ts), not by linking the payment to an organization record.
-    const result = await createPaymentOrder({
-      purpose: 'rfs_document',
-      tenderId,
-      organizationId: null,
-      payerName: parsed.data.payerName,
-      payerEmail,
-      payerCompany: parsed.data.company,
-      payerDesignation: parsed.data.designation,
-      payerMobile: parsed.data.mobile,
-      payerIsGenerator: parsed.data.isGenerator,
-      consentGivenAt: new Date(),
-      notes: parsed.data.notes ?? null,
-    });
-
-    res.json({ success: true, ...result });
   } catch (err) {
     next(err);
   }
@@ -183,16 +212,51 @@ router.post('/payment/orders', orderLimiter, ...authRequired(), async (req, res,
     const tender = await Tender.findByPk(parsed.data.tenderId);
     if (!tender) return res.status(404).json({ success: false, error: 'Tender not found' });
 
-    const result = await createPaymentOrder({
-      purpose: parsed.data.purpose,
-      tenderId: parsed.data.tenderId,
-      organizationId: req.org!.id,
-      payerName: null,
-      payerEmail: null,
-      notes: null,
-    });
+    const lockKey = `payment-order-lock:${parsed.data.purpose}:${parsed.data.tenderId}:org${req.org!.id}`;
+    try {
+      const result = await withLock(lockKey, PAYMENT_ORDER_LOCK_TTL_MS, async () => {
+        // De-dup guard, same as the rfs-document route above — without this, a retried/double-
+        // clicked frontend request (or a browser tab closed and reopened before the first order's
+        // /verify call resolved) could spawn a second Razorpay order, and be charged twice, for the
+        // same fee. Not in a terminal 'failed' state means 'created'/'attempted'/'paid' — a failed
+        // attempt doesn't block a genuine retry. Run inside the lock above so a second concurrent
+        // request can't read "nothing exists yet" before the first one's Payment.create has landed.
+        const existing = await Payment.findOne({
+          where: { tenderId: parsed.data.tenderId, organizationId: req.org!.id, purpose: parsed.data.purpose, status: { [Op.ne]: 'failed' } },
+          order: [['id', 'DESC']],
+        });
+        if (existing) {
+          if (existing.status === 'paid') {
+            return { alreadyPaid: true as const };
+          }
+          // Still in progress ('created'/'attempted') — resume that same order rather than
+          // spawning a second one; the frontend's checkout flow behaves identically either way.
+          const { keyId } = await getRazorpayConfig();
+          return { alreadyPaid: false as const, orderId: existing.razorpayOrderId, amount: existing.amountPaise, currency: existing.currency, keyId };
+        }
 
-    res.json({ success: true, ...result });
+        const created = await createPaymentOrder({
+          purpose: parsed.data.purpose,
+          tenderId: parsed.data.tenderId,
+          organizationId: req.org!.id,
+          payerName: null,
+          payerEmail: null,
+          notes: null,
+        });
+        return { alreadyPaid: false as const, ...created };
+      });
+
+      if (result.alreadyPaid) {
+        return res.status(409).json({ success: false, error: 'This fee has already been paid' });
+      }
+      const { alreadyPaid: _alreadyPaid, ...rest } = result;
+      res.json({ success: true, ...rest });
+    } catch (err) {
+      if (err instanceof LockContentionError) {
+        return res.status(409).json({ success: false, error: 'A payment request for this fee is already being processed — please wait a moment and try again.' });
+      }
+      throw err;
+    }
   } catch (err) {
     next(err);
   }
@@ -258,7 +322,7 @@ router.post('/payment/verify', verifyLimiter, async (req, res, next) => {
 // against, so it's gated on the same payerEmail traceability the plan already accepts as
 // proportionate for that account-less Stage 3 flow (see rfsDocumentAccessService.ts's identical
 // reasoning).
-const invoiceLimiter = rateLimit({ windowMs: 60 * 1000, limit: 30, standardHeaders: true, legacyHeaders: false });
+const invoiceLimiter = rateLimit({ name: 'payments:invoice', windowMs: 60 * 1000, limit: 30 });
 
 router.get('/payment/:id/invoice', invoiceLimiter, optionalAuth, async (req, res, next) => {
   try {
@@ -302,7 +366,7 @@ router.get('/payment/:id/invoice', invoiceLimiter, optionalAuth, async (req, res
 // checkout and the browser calling /verify. Deliberately does NOT require the org/buyer auth used
 // elsewhere in this file — Razorpay itself is the caller, authenticated by the signature check
 // below, not a bearer token.
-const webhookLimiter = rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false });
+const webhookLimiter = rateLimit({ name: 'payments:webhook', windowMs: 60 * 1000, limit: 120 });
 
 router.post('/payment/webhook', webhookLimiter, async (req, res) => {
   // req.rawBody is populated by index.ts's express.json({ verify }) — see that file's comment.
@@ -339,6 +403,9 @@ router.post('/payment/webhook', webhookLimiter, async (req, res) => {
       case 'refund.processed':
         await processRefundProcessed(req.body.payload.refund.entity);
         break;
+      case 'refund.failed':
+        await processRefundFailed(req.body.payload.refund.entity);
+        break;
       default:
         logger.info({ reqId: req.requestId, event }, '[WEBHOOK] unhandled event type — ignored');
     }
@@ -352,7 +419,7 @@ router.post('/payment/webhook', webhookLimiter, async (req, res) => {
 // alternatives, same admin-org-token pattern used throughout this codebase (tenders.ts,
 // tenderDocuments.ts, emdSubmissions.ts). Finds every payment stuck in 'created' for more than 30
 // minutes and asks Razorpay directly what actually happened to it.
-const reconcileLimiter = rateLimit({ windowMs: 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
+const reconcileLimiter = rateLimit({ name: 'payments:reconcile', windowMs: 60 * 1000, limit: 10 });
 
 router.post('/payment/reconcile', reconcileLimiter, ...authRequired('admin'), async (req, res, next) => {
   try {
@@ -375,7 +442,7 @@ const refundBodySchema = z
   })
   .strict();
 
-const refundLimiter = rateLimit({ windowMs: 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
+const refundLimiter = rateLimit({ name: 'payments:refund', windowMs: 60 * 1000, limit: 10 });
 
 router.post('/payment/:id/refund', refundLimiter, ...authRequired('admin'), async (req, res, next) => {
   try {
